@@ -147,6 +147,8 @@ enum AppMode {
     TimeFilterSetup,
     /// Time filter configuration - configure filter options
     TimeFilterConfig,
+    /// Value filter selection - choose values to show
+    ValueFilterSetup,
 }
 
 /// Sort order for columns
@@ -220,6 +222,15 @@ struct TimeFilter {
     column_name: String,
     /// Filter mode
     mode: TimeFilterMode,
+}
+
+/// Value filter for categorical columns
+#[derive(Debug, Clone)]
+struct ValueFilter {
+    /// Column name to filter on
+    column_name: String,
+    /// Selected values to show (empty = show all)
+    selected_values: Vec<String>,
 }
 
 /// Time filter mode options
@@ -338,6 +349,16 @@ struct App {
     time_filter_ms: u64,
     /// Temporary storage for range filter start timestamp
     range_filter_start: Option<i64>,
+    /// Value filters (per column)
+    value_filters: Vec<ValueFilter>,
+    /// Unique values for current column being filtered
+    value_filter_options: Vec<String>,
+    /// Selected values in value filter popup (indices)
+    value_filter_selections: Vec<bool>,
+    /// List state for value filter popup
+    value_filter_list_state: ListState,
+    /// Column being filtered by value
+    value_filter_column: Option<String>,
 }
 
 impl App {
@@ -401,6 +422,11 @@ impl App {
             time_filter_mode_choice: None,
             time_filter_ms: 0,
             range_filter_start: None,
+            value_filters: Vec::new(),
+            value_filter_options: Vec::new(),
+            value_filter_selections: Vec::new(),
+            value_filter_list_state: ListState::default(),
+            value_filter_column: None,
         }
     }
 
@@ -524,6 +550,11 @@ impl App {
             df = self.apply_time_filter_lazy(df, time_filter)?;
         }
 
+        // Apply value filters
+        for value_filter in &self.value_filters {
+            df = self.apply_value_filter_lazy(df, value_filter)?;
+        }
+
         self.current_df = Arc::new(df.collect()?);
         self.filtered_rows = self.current_df.height();
         self.time_filter_ms = start.elapsed().as_millis() as u64;
@@ -585,6 +616,34 @@ impl App {
         }
     }
 
+    /// Apply value filter with lazy evaluation
+    fn apply_value_filter_lazy(&self, df: LazyFrame, filter: &ValueFilter) -> Result<LazyFrame> {
+        if filter.selected_values.is_empty() {
+            return Ok(df);
+        }
+
+        // Build filter expression: column value is in selected values
+        // Convert to string for comparison to match how we extracted unique values
+        let mut filter_expr: Option<Expr> = None;
+        
+        for value in &filter.selected_values {
+            let value_filter = col(&filter.column_name)
+                .cast(DataType::String)
+                .eq(lit(value.clone()));
+            
+            filter_expr = Some(match filter_expr {
+                Some(expr) => expr.or(value_filter),
+                None => value_filter,
+            });
+        }
+
+        if let Some(expr) = filter_expr {
+            Ok(df.filter(expr))
+        } else {
+            Ok(df)
+        }
+    }
+
     /// Apply time filter with lazy evaluation
     fn apply_time_filter_lazy(&self, df: LazyFrame, filter: &TimeFilter) -> Result<LazyFrame> {
         match &filter.mode {
@@ -625,7 +684,7 @@ impl App {
     fn apply_search_filter(&mut self) -> Result<()> {
         let start = Instant::now();
 
-        if self.search_query.is_empty() && self.time_filters.is_empty() {
+        if self.search_query.is_empty() && self.time_filters.is_empty() && self.value_filters.is_empty() {
             // Reset to original (with sort applied if any)
             self.current_df = Arc::clone(&self.original_df);
         } else {
@@ -702,11 +761,11 @@ impl App {
             Some((original_idx, new_order))
         };
 
-        // Reset to filtered data (or original if no filter)
-        if self.search_query.is_empty() {
+        // Reset to filtered data (or original if no filters)
+        if self.search_query.is_empty() && self.time_filters.is_empty() && self.value_filters.is_empty() {
             self.current_df = Arc::clone(&self.original_df);
         } else {
-            self.apply_search_filter()?;
+            self.apply_all_filters()?;
             return Ok(());
         }
 
@@ -841,6 +900,7 @@ impl App {
             AppMode::CellDetail => self.handle_cell_detail_mode(event)?,
             AppMode::TimeFilterSetup => self.handle_time_filter_setup(event)?,
             AppMode::TimeFilterConfig => self.handle_time_filter_config(event)?,
+            AppMode::ValueFilterSetup => self.handle_value_filter_setup(event)?,
         }
         Ok(())
     }
@@ -914,19 +974,30 @@ impl App {
                     }
                 }
 
-                // Clear search
+                // Value filter
+                KeyCode::Char('v') => {
+                    self.start_value_filter()?;
+                }
+
+                // Clear all filters
                 KeyCode::Esc => {
-                    if !self.search_query.is_empty() {
+                    let had_filters = !self.search_query.is_empty() 
+                        || !self.time_filters.is_empty() 
+                        || !self.value_filters.is_empty();
+                    
+                    if had_filters {
                         self.search_query.clear();
                         self.search_input = Input::default();
-                        self.apply_search_filter()?;
-                        self.status_message = "Search cleared".to_string();
+                        self.time_filters.clear();
+                        self.value_filters.clear();
+                        self.apply_all_filters()?;
+                        self.status_message = "All filters cleared".to_string();
                     }
                 }
 
                 // Help
                 KeyCode::Char('?') => {
-                    self.status_message = "Keys: j/k=↑↓ h/l=←→ /=search s=sort c=columns t=time filter Alt+←/→=resize q=quit".to_string();
+                    self.status_message = "Keys: j/k=↑↓ h/l=←→ /=search s=sort c=columns t=time v=value filter Alt+←/→=resize q=quit".to_string();
                 }
 
                 // View cell detail
@@ -1076,17 +1147,17 @@ impl App {
                 KeyCode::Char('1') if self.time_filter_mode_choice.is_none() => {
                     self.time_filter_mode_choice = Some(1);
                     self.time_filter_input = Input::default();
-                    self.status_message = "After date (format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
+                    self.status_message = "After timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
                 }
                 KeyCode::Char('2') if self.time_filter_mode_choice.is_none() => {
                     self.time_filter_mode_choice = Some(2);
                     self.time_filter_input = Input::default();
-                    self.status_message = "Before date (format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
+                    self.status_message = "Before timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
                 }
                 KeyCode::Char('3') if self.time_filter_mode_choice.is_none() => {
                     self.time_filter_mode_choice = Some(3);
                     self.time_filter_input = Input::default();
-                    self.status_message = "Start date (format: YYYY-MM-DD)".to_string();
+                    self.status_message = "Start timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
                 }
                 KeyCode::Char('4') if self.time_filter_mode_choice.is_none() => {
                     self.time_filter_mode_choice = Some(4);
@@ -1233,6 +1304,198 @@ impl App {
                         self.time_filter_input.handle_event(&event);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Start value filter for selected column
+    fn start_value_filter(&mut self) -> Result<()> {
+        const MAX_UNIQUE_VALUES: usize = 100;
+
+        // Get the selected column
+        let visible_cols: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| c.visible)
+            .map(|c| c.name.clone())
+            .collect();
+
+        if visible_cols.is_empty() {
+            self.status_message = "No columns available".to_string();
+            return Ok(());
+        }
+
+        if self.selected_column >= visible_cols.len() {
+            self.status_message = "Invalid column selection".to_string();
+            return Ok(());
+        }
+
+        let col_name = visible_cols[self.selected_column].clone();
+
+        // Get unique values from the ORIGINAL dataframe (not filtered)
+        // This ensures all possible values are available for selection
+        if let Ok(col) = self.original_df.column(&col_name) {
+            let unique_result = col.unique();
+            
+            match unique_result {
+                Ok(unique_series) => {
+                    let n_unique = unique_series.len();
+
+                    if n_unique > MAX_UNIQUE_VALUES {
+                        self.status_message = format!(
+                            "Column '{}' has {} unique values (max {}). Use search (/) instead.",
+                            col_name, n_unique, MAX_UNIQUE_VALUES
+                        );
+                        return Ok(());
+                    }
+
+                    if n_unique == 0 {
+                        self.status_message = format!("Column '{}' has no values", col_name);
+                        return Ok(());
+                    }
+
+                    // Convert unique values to strings and sort
+                    // Extract actual string representation that matches the data
+                    let mut values: Vec<String> = (0..unique_series.len())
+                        .filter_map(|i| {
+                            unique_series.get(i).ok().and_then(|v| {
+                                // Use get_str() for string types, format for others
+                                match v {
+                                    polars::prelude::AnyValue::String(s) => Some(s.to_string()),
+                                    polars::prelude::AnyValue::StringOwned(s) => Some(s.to_string()),
+                                    _ => Some(format!("{}", v)),
+                                }
+                            })
+                        })
+                        .collect();
+                    values.sort();
+
+                    // Initialize selections - check if there's an existing filter
+                    let existing_filter = self.value_filters
+                        .iter()
+                        .find(|f| f.column_name == col_name);
+
+                    let selections = if let Some(filter) = existing_filter {
+                        // Pre-select values that are in the existing filter
+                        values
+                            .iter()
+                            .map(|v| filter.selected_values.contains(v))
+                            .collect()
+                    } else {
+                        // All selected by default
+                        vec![true; values.len()]
+                    };
+
+                    self.value_filter_options = values;
+                    self.value_filter_selections = selections;
+                    self.value_filter_column = Some(col_name.clone());
+                    self.value_filter_list_state.select(Some(0));
+                    self.mode = AppMode::ValueFilterSetup;
+                    self.status_message = format!(
+                        "Column '{}': {} unique values. Space=toggle, a=all, n=none, Enter=apply",
+                        col_name, n_unique
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Error getting unique values: {}", e);
+                }
+            }
+        } else {
+            self.status_message = format!("Column '{}' not found", col_name);
+        }
+
+        Ok(())
+    }
+
+    fn handle_value_filter_setup(&mut self, event: Event) -> Result<()> {
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Enter => {
+                    // Apply the filter
+                    if let Some(col_name) = &self.value_filter_column.clone() {
+                        let selected_values: Vec<String> = self
+                            .value_filter_options
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, v)| {
+                                if self.value_filter_selections.get(i) == Some(&true) {
+                                    Some(v.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // Remove existing filter for this column
+                        self.value_filters.retain(|f| f.column_name != *col_name);
+
+                        // Add new filter only if not all values are selected
+                        let all_selected = self.value_filter_selections.iter().all(|&x| x);
+                        if !all_selected && !selected_values.is_empty() {
+                            self.value_filters.push(ValueFilter {
+                                column_name: col_name.clone(),
+                                selected_values: selected_values.clone(),
+                            });
+                        }
+
+                        // Apply all filters
+                        self.apply_all_filters()?;
+
+                        let filter_msg = if all_selected {
+                            format!("Value filter cleared for '{}'", col_name)
+                        } else {
+                            format!(
+                                "Value filter applied to '{}': {} values selected",
+                                col_name,
+                                selected_values.len()
+                            )
+                        };
+                        self.status_message = filter_msg;
+                    }
+
+                    self.mode = AppMode::Normal;
+                }
+                KeyCode::Esc => {
+                    self.mode = AppMode::Normal;
+                    self.status_message = "Value filter cancelled".to_string();
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle selected value
+                    if let Some(idx) = self.value_filter_list_state.selected() {
+                        if idx < self.value_filter_selections.len() {
+                            self.value_filter_selections[idx] = !self.value_filter_selections[idx];
+                        }
+                    }
+                }
+                KeyCode::Char('a') => {
+                    // Select all
+                    self.value_filter_selections = vec![true; self.value_filter_options.len()];
+                    self.status_message = "All values selected".to_string();
+                }
+                KeyCode::Char('n') => {
+                    // Select none - but keep at least one selected
+                    let current_idx = self.value_filter_list_state.selected().unwrap_or(0);
+                    self.value_filter_selections = vec![false; self.value_filter_options.len()];
+                    if current_idx < self.value_filter_selections.len() {
+                        self.value_filter_selections[current_idx] = true;
+                    }
+                    self.status_message = "All values deselected except current".to_string();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let current = self.value_filter_list_state.selected().unwrap_or(0);
+                    let max = self.value_filter_options.len().saturating_sub(1);
+                    if current < max {
+                        self.value_filter_list_state.select(Some(current + 1));
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let current = self.value_filter_list_state.selected().unwrap_or(0);
+                    if current > 0 {
+                        self.value_filter_list_state.select(Some(current - 1));
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1432,6 +1695,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.mode == AppMode::TimeFilterConfig {
         render_time_filter_config_popup(frame, app);
     }
+
+    // Render value filter popup if active
+    if app.mode == AppMode::ValueFilterSetup {
+        render_value_filter_popup(frame, app);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -1449,7 +1717,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Build filter info string
-    let filter_info = if app.search_query.is_empty() && app.time_filters.is_empty() {
+    let filter_info = if app.search_query.is_empty() && app.time_filters.is_empty() && app.value_filters.is_empty() {
         "No filter".to_string()
     } else {
         let mut parts = Vec::new();
@@ -1459,6 +1727,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         if !app.time_filters.is_empty() {
             for tf in &app.time_filters {
                 parts.push(format!("{}:{}", tf.column_name, tf.mode.label()));
+            }
+        }
+        if !app.value_filters.is_empty() {
+            for vf in &app.value_filters {
+                parts.push(format!("{}:{} vals", vf.column_name, vf.selected_values.len()));
             }
         }
         parts.join(" | ")
@@ -1701,7 +1974,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    "/ search  s sort  c columns  t time-filter  q quit",
+                    "/ search  s sort  c columns  t time-filter  v value-filter  q quit",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]))
@@ -1897,6 +2170,89 @@ fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
     frame.render_widget(footer, chunks[2]);
 }
 
+fn render_value_filter_popup(frame: &mut Frame, app: &mut App) {
+    // Create centered popup
+    let area = centered_rect(60, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    // Header with column name and count
+    let default_col = "Unknown".to_string();
+    let col_name = app.value_filter_column.as_ref().unwrap_or(&default_col);
+    let selected_count = app.value_filter_selections.iter().filter(|&&x| x).count();
+    let header = Paragraph::new(format!(
+        " Filter '{}' ({}/{} selected) ",
+        col_name,
+        selected_count,
+        app.value_filter_options.len()
+    ))
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::Cyan).bold())
+    .block(
+        Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    // List of values with checkboxes
+    let items: Vec<ListItem> = app
+        .value_filter_options
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let checkbox = if app.value_filter_selections.get(idx) == Some(&true) {
+                "[✓]"
+            } else {
+                "[ ]"
+            };
+            let style = if app.value_filter_selections.get(idx) == Some(&true) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            // Truncate long values
+            let display_value = truncate_string(value, 50);
+            ListItem::new(format!(" {} {}", checkbox, display_value)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, chunks[1], &mut app.value_filter_list_state.clone());
+
+    // Footer with instructions
+    let footer = Paragraph::new("Space=toggle, a=all, n=none, Enter=apply, Esc=cancel")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Gray))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(footer, chunks[2]);
+}
+
 fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
     // Create centered popup
     let area = centered_rect(70, 60, frame.area());
@@ -1928,9 +2284,9 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
     if app.time_filter_mode_choice.is_none() {
         // Show filter type selection
         let options = vec![
-            "1: After - Show rows after a specific date",
-            "2: Before - Show rows before a specific date",
-            "3: Range - Show rows between two dates",
+            "1: After  - Show rows after a specific date/time",
+            "2: Before - Show rows before a specific date/time",
+            "3: Range  - Show rows between two dates/times",
             "4: Last N - Show rows from last N minutes/hours/days/weeks",
         ];
         let text = options.join("\n");
@@ -1956,13 +2312,13 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
     } else {
         // Show input field for the selected filter type
         let input_label = match app.time_filter_mode_choice {
-            Some(1) => "After date (YYYY-MM-DD):",
-            Some(2) => "Before date (YYYY-MM-DD):",
+            Some(1) => "After timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS):",
+            Some(2) => "Before timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS):",
             Some(3) => {
                 if app.range_filter_start.is_none() {
-                    "Start date (YYYY-MM-DD):"
+                    "Start timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS):"
                 } else {
-                    "End date (YYYY-MM-DD):"
+                    "End timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS):"
                 }
             }
             Some(4) => "Last N (e.g., '7 days', '24 hours', '30 minutes'):",
