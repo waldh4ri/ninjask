@@ -2013,7 +2013,7 @@ fn render_column_popup(frame: &mut Frame, app: &mut App) {
             };
             
             let move_indicator = if is_being_moved { " ↕" } else { "" };
-            ListItem::new(format!("{} {}{}", checkbox, col.name, move_indicator)).style(style)
+            ListItem::new(format!("  {} {}{}  ", checkbox, col.name, move_indicator)).style(style)
         })
         .collect();
 
@@ -2084,7 +2084,8 @@ fn render_cell_detail_popup(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(" Press Enter to close ")
                 .title_alignment(Alignment::Center)
-                .title_position(ratatui::widgets::block::Position::Bottom),
+                .title_position(ratatui::widgets::block::Position::Bottom)
+                .padding(ratatui::widgets::Padding::new(2, 2, 1, 1)),
         );
     frame.render_widget(content, chunks[1]);
 }
@@ -2139,7 +2140,7 @@ fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = app
         .datetime_columns
         .iter()
-        .map(|col| ListItem::new(format!("  {}", col)))
+        .map(|col| ListItem::new(format!("    {}  ", col)))
         .collect();
 
     let list = List::new(items)
@@ -2221,7 +2222,7 @@ fn render_value_filter_popup(frame: &mut Frame, app: &mut App) {
             };
             // Truncate long values
             let display_value = truncate_string(value, 50);
-            ListItem::new(format!(" {} {}", checkbox, display_value)).style(style)
+            ListItem::new(format!("   {} {}  ", checkbox, display_value)).style(style)
         })
         .collect();
 
@@ -2284,12 +2285,12 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
     if app.time_filter_mode_choice.is_none() {
         // Show filter type selection
         let options = vec![
-            "1: After  - Show rows after a specific date/time",
-            "2: Before - Show rows before a specific date/time",
-            "3: Range  - Show rows between two dates/times",
-            "4: Last N - Show rows from last N minutes/hours/days/weeks",
+            "  1: After  - Show rows after a specific date/time",
+            "  2: Before - Show rows before a specific date/time",
+            "  3: Range  - Show rows between two dates/times",
+            "  4: Last N - Show rows from last N minutes/hours/days/weeks",
         ];
-        let text = options.join("\n");
+        let text = format!("\n{}\n", options.join("\n"));
         let content = Paragraph::new(text)
             .style(Style::default().fg(Color::White))
             .wrap(ratatui::widgets::Wrap { trim: false })
@@ -2297,6 +2298,7 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
                 Block::default()
                     .borders(Borders::LEFT | Borders::RIGHT)
                     .border_style(Style::default().fg(Color::Cyan))
+                    .padding(ratatui::widgets::Padding::new(2, 2, 0, 0)),
             );
         frame.render_widget(content, chunks[1]);
 
@@ -2325,19 +2327,20 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
             _ => "Input:",
         };
 
-        let content = Paragraph::new(format!("{}\n\n{}", input_label, app.time_filter_input.value()))
+        let content = Paragraph::new(format!("\n{}\n\n{}", input_label, app.time_filter_input.value()))
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
                     .borders(Borders::LEFT | Borders::RIGHT)
                     .border_style(Style::default().fg(Color::Yellow))
+                    .padding(ratatui::widgets::Padding::new(2, 2, 0, 0))
             );
         frame.render_widget(content, chunks[1]);
 
-        // Show cursor
-        let input_line = app.time_filter_input.value().len() + 3;
+        // Show cursor (adjusted for padding: left=2, top=0 + 1 newline before label = 1)
+        let input_line = 4; // 1 (top padding newline) + 1 (label line) + 2 (blank lines after label)
         frame.set_cursor_position((
-            chunks[1].x + app.time_filter_input.visual_cursor() as u16 + 1,
+            chunks[1].x + app.time_filter_input.visual_cursor() as u16 + 3, // +1 border +2 left padding
             chunks[1].y + input_line as u16,
         ));
 
