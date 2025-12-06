@@ -1989,8 +1989,10 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_column_popup(frame: &mut Frame, app: &mut App) {
-    // Create centered popup
-    let area = centered_rect(50, 60, frame.area());
+    // Create centered popup with adaptive height
+    // Height = title (3) + items + borders (2) = items + 5
+    let content_height = (app.columns.len() as u16).saturating_add(5);
+    let area = centered_rect_adaptive(50, content_height, 80, frame.area());
 
     // Clear background
     frame.render_widget(Clear, area);
@@ -2111,9 +2113,40 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// Create centered rectangle with adaptive height based on content
+/// content_height: number of lines needed (including borders, padding, etc.)
+/// max_percent: maximum height as percentage (fallback if content is too tall)
+fn centered_rect_adaptive(percent_x: u16, content_height: u16, max_percent: u16, area: Rect) -> Rect {
+    // Calculate desired height, but cap at max_percent of screen
+    let max_height = (area.height * max_percent) / 100;
+    let height = content_height.min(max_height);
+    
+    let vertical_margin = (area.height.saturating_sub(height)) / 2;
+    
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(vertical_margin),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
-    // Create centered popup
-    let area = centered_rect(60, 60, frame.area());
+    // Create centered popup with adaptive height
+    // Height = header (3) + items + footer (2) = items + 5
+    let content_height = (app.datetime_columns.len() as u16).saturating_add(5);
+    let area = centered_rect_adaptive(60, content_height, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let chunks = Layout::default()
@@ -2172,8 +2205,10 @@ fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_value_filter_popup(frame: &mut Frame, app: &mut App) {
-    // Create centered popup
-    let area = centered_rect(60, 70, frame.area());
+    // Create centered popup with adaptive height
+    // Height = header (3) + items + footer (3) = items + 6
+    let content_height = (app.value_filter_options.len() as u16).saturating_add(6);
+    let area = centered_rect_adaptive(60, content_height, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let chunks = Layout::default()
