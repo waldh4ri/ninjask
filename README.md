@@ -28,9 +28,22 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
 ./target/release/ninjask [OPTIONS]
 ```
 
-Options:
-- `-f <file.csv>`: Specify CSV file to load (default: data.csv)
-- `-h`: Show help
+### Options
+- `-f, --file <PATH>`: CSV file to load (default: data.csv)
+- `-d, --delimiter <SEP>`: Delimiter character (auto-detected if not specified)
+  - Examples: `,`, `;`, `tab`, `|`
+- `--test`: Generate dummy data.csv file if it doesn't exist
+- `-h, --help`: Show this help message
+
+### Keybindings
+- `j/k` or `↑/↓`: Navigate rows
+- `h/l` or `←/→`: Navigate columns
+- `/`: Search data (regex)
+- `s`: Sort by selected column
+- `c`: Column visibility picker
+- `t`: Time filter
+- `v`: Value filter
+- `q`: Quit
 
 ## Status
 
