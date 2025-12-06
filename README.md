@@ -21,10 +21,6 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
    ```sh
    cargo build --release
    ```
-4. Run the tool:
-   ```sh
-   ./target/release/ninjask [OPTIONS]
-   ```
 
 ## Usage
 
