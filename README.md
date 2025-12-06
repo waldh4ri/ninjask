@@ -1,4 +1,5 @@
-# Ninjask
+
+# <img src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/291.png" height="35" align="top"/> Ninjask
 
 **WIP: Terminal CSV Explorer for Large Files**
 
@@ -15,6 +16,8 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
 2. Clone the repository and enter the project directory:
    ```sh
    git clone git@github.com:waldh4ri/ninjask.git
+   ```
+   ```sh
    cd ninjask
    ```
 3. Build in release mode for best performance:
@@ -25,9 +28,12 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
 ## Usage
 
 ```sh
-./target/release/ninjask [OPTIONS]
+./target/release/ninjask -f data.csv
 ```
-
+You can generate a dummy 100k lines data.csv like this:
+```sh
+./target/release/ninjask --test
+```
 ### Options
 - `-f, --file <PATH>`: CSV file to load (default: data.csv)
 - `-d, --delimiter <SEP>`: Delimiter character (auto-detected if not specified)
