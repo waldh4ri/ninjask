@@ -12,9 +12,10 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -109,6 +110,26 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Sanitize string for display - handles binary data, control characters, and invalid UTF-8
+fn sanitize_for_display(s: &str, max_chars: usize) -> String {
+    // First pass: clean control characters and normalize whitespace
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '�' // Unicode replacement character for control chars
+            } else if c.is_whitespace() && c != ' ' && c != '\n' && c != '\t' {
+                ' ' // Normalize exotic whitespace to regular space
+            } else {
+                c
+            }
+        })
+        .collect();
+    
+    // Second pass: truncate to max length
+    truncate_string(&cleaned, max_chars)
+}
+
 // ================= Application State Types =================
 
 /// Application mode
@@ -122,6 +143,10 @@ enum AppMode {
     ColumnSelection,
     /// Cell detail popup is open
     CellDetail,
+    /// Time filter setup - select column
+    TimeFilterSetup,
+    /// Time filter configuration - configure filter options
+    TimeFilterConfig,
 }
 
 /// Sort order for columns
@@ -155,6 +180,95 @@ impl SortOrder {
     }
 }
 
+/// Time unit for relative filtering
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeUnit {
+    Minutes,
+    Hours,
+    Days,
+    Weeks,
+    Months,
+}
+
+impl TimeUnit {
+    fn label(&self) -> &'static str {
+        match self {
+            TimeUnit::Minutes => "minutes",
+            TimeUnit::Hours => "hours",
+            TimeUnit::Days => "days",
+            TimeUnit::Weeks => "weeks",
+            TimeUnit::Months => "months",
+        }
+    }
+
+    #[allow(dead_code)]
+    fn all_units() -> [TimeUnit; 5] {
+        [
+            TimeUnit::Minutes,
+            TimeUnit::Hours,
+            TimeUnit::Days,
+            TimeUnit::Weeks,
+            TimeUnit::Months,
+        ]
+    }
+}
+
+/// Time filter configuration for datetime columns
+#[derive(Debug, Clone)]
+struct TimeFilter {
+    /// Column name to filter on
+    column_name: String,
+    /// Filter mode
+    mode: TimeFilterMode,
+}
+
+/// Time filter mode options
+#[derive(Debug, Clone, PartialEq)]
+enum TimeFilterMode {
+    /// No filter
+    None,
+    /// After a specific date/time (seconds since epoch)
+    After(i64),
+    /// Before a specific date/time (seconds since epoch)
+    Before(i64),
+    /// Between two dates/times (seconds since epoch)
+    Range(i64, i64),
+    /// Relative: last N days/hours/minutes
+    LastN(u32, TimeUnit),
+}
+
+impl TimeFilterMode {
+    fn label(&self) -> String {
+        match self {
+            TimeFilterMode::None => "None".to_string(),
+            TimeFilterMode::After(ts) => {
+                let dt = DateTime::<Utc>::from_timestamp(*ts, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                format!("After {}", dt)
+            }
+            TimeFilterMode::Before(ts) => {
+                let dt = DateTime::<Utc>::from_timestamp(*ts, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                format!("Before {}", dt)
+            }
+            TimeFilterMode::Range(start, end) => {
+                let start_dt = DateTime::<Utc>::from_timestamp(*start, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                let end_dt = DateTime::<Utc>::from_timestamp(*end, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                format!("{} to {}", start_dt, end_dt)
+            }
+            TimeFilterMode::LastN(n, unit) => {
+                format!("Last {} {}", n, unit.label())
+            }
+        }
+    }
+}
+
 /// Column state: visibility and width
 #[derive(Debug, Clone)]
 struct ColumnState {
@@ -162,6 +276,8 @@ struct ColumnState {
     visible: bool,
     /// Cached display width (auto-calculated from data)
     display_width: u16,
+    /// User manually adjusted width (overrides auto-calculated)
+    manual_width: Option<u16>,
 }
 
 /// Main application state
@@ -206,6 +322,22 @@ struct App {
     load_time_ms: u64,
     /// Last search time (ms)
     search_time_ms: u64,
+    /// Active time filters (per column)
+    time_filters: Vec<TimeFilter>,
+    /// Time filter input state during configuration
+    time_filter_input: Input,
+    /// Selected datetime column for filtering
+    selected_time_column: Option<String>,
+    /// Datetime columns in the DataFrame
+    datetime_columns: Vec<String>,
+    /// Column picker state for time filters
+    time_filter_list_state: ListState,
+    /// Current time filter mode being configured (1-4 for filter type)
+    time_filter_mode_choice: Option<u32>,
+    /// Last time filter application time (ms)
+    time_filter_ms: u64,
+    /// Temporary storage for range filter start timestamp
+    range_filter_start: Option<i64>,
 }
 
 impl App {
@@ -223,6 +355,7 @@ impl App {
                 name: name.clone(),
                 visible: true,
                 display_width: 10, // Will be calculated below
+                manual_width: None,
             })
             .collect();
 
@@ -260,6 +393,14 @@ impl App {
             cell_detail_column: String::new(),
             load_time_ms: 0,
             search_time_ms: 0,
+            time_filters: Vec::new(),
+            time_filter_input: Input::default(),
+            selected_time_column: None,
+            datetime_columns: Vec::new(),
+            time_filter_list_state: ListState::default(),
+            time_filter_mode_choice: None,
+            time_filter_ms: 0,
+            range_filter_start: None,
         }
     }
 
@@ -289,10 +430,21 @@ impl App {
             col_state.display_width = ((max_width + 1) as u16).clamp(MIN_WIDTH, MAX_WIDTH);
         }
     }
-
     /// Recalculate column widths from filtered data
     fn recalculate_column_widths(&mut self) {
         Self::calculate_column_widths(&self.current_df, &mut self.columns, 500);
+    }
+
+    /// Resize the selected column
+    fn resize_selected_column(&mut self, delta: i16) {
+        if let Some(original_idx) = self.visible_column_original_index(self.selected_column) {
+            let col = &mut self.columns[original_idx];
+            let current_width = col.manual_width.unwrap_or(col.display_width);
+            let new_width = (current_width as i16 + delta).clamp(5, 200) as u16;
+            col.manual_width = Some(new_width);
+            
+            self.status_message = format!("Column '{}' width: {}", col.name, new_width);
+        }
     }
 
     /// Get visible column names
@@ -314,58 +466,171 @@ impl App {
             .map(|(idx, _)| idx)
     }
 
+    /// Calculate milliseconds ago for relative time filtering
+    fn calculate_ms_ago(&self, n: u32, unit: TimeUnit) -> i64 {
+        let ms = match unit {
+            TimeUnit::Minutes => 60_000,
+            TimeUnit::Hours => 3_600_000,
+            TimeUnit::Days => 86_400_000,
+            TimeUnit::Weeks => 604_800_000,
+            TimeUnit::Months => 2_592_000_000, // 30 days
+        };
+        (n as i64) * ms
+    }
+
+    /// Parse datetime string (supports multiple formats)
+    fn parse_datetime(&self, input: &str) -> Option<i64> {
+        // Try ISO 8601 formats first
+        if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
+            return Some(dt.timestamp());
+        }
+        if let Ok(dt) = DateTime::parse_from_rfc2822(input) {
+            return Some(dt.timestamp());
+        }
+
+        // Try basic formats: YYYY-MM-DD and YYYY-MM-DDTHH:MM:SS
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+            let ndt = date.and_hms_opt(0, 0, 0)?;
+            let dt = DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc);
+            return Some(dt.timestamp());
+        }
+
+        if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S") {
+            let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+            return Some(utc_dt.timestamp());
+        }
+
+        if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
+            let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+            return Some(utc_dt.timestamp());
+        }
+
+        None
+    }
+
+    /// Apply all filters (search + time filters) to DataFrame
+    fn apply_all_filters(&mut self) -> Result<()> {
+        let start = Instant::now();
+
+        let mut df = (*self.original_df).clone().lazy();
+
+        // Apply search filter
+        if !self.search_query.is_empty() {
+            df = self.apply_search_filter_lazy(df)?;
+        }
+
+        // Apply time filters
+        for time_filter in &self.time_filters {
+            df = self.apply_time_filter_lazy(df, time_filter)?;
+        }
+
+        self.current_df = Arc::new(df.collect()?);
+        self.filtered_rows = self.current_df.height();
+        self.time_filter_ms = start.elapsed().as_millis() as u64;
+
+        // Re-apply sort if active
+        self.apply_current_sort()?;
+
+        // Recalculate column widths for filtered data
+        self.recalculate_column_widths();
+
+        // Reset selection if out of bounds
+        if self.filtered_rows == 0 {
+            self.table_state.select(None);
+        } else if let Some(selected) = self.table_state.selected() {
+            if selected >= self.filtered_rows {
+                self.table_state.select(Some(self.filtered_rows - 1));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply search filter with lazy evaluation
+    fn apply_search_filter_lazy(&self, df: LazyFrame) -> Result<LazyFrame> {
+        let pattern = if self.search_query.starts_with("(?") {
+            self.search_query.clone()
+        } else {
+            format!("(?i){}", self.search_query)
+        };
+
+        // Validate the regex early
+        if let Err(err) = regex::Regex::new(&pattern) {
+            return Err(anyhow::anyhow!("Invalid regex: {}", err));
+        }
+
+        let visible_cols = self.visible_columns();
+        if visible_cols.is_empty() {
+            return Ok(df);
+        }
+
+        let mut filter_expr: Option<Expr> = None;
+
+        for col_name in &visible_cols {
+            let col_filter = col(*col_name)
+                .cast(DataType::String)
+                .str()
+                .contains(lit(pattern.clone()), false);
+
+            filter_expr = Some(match filter_expr {
+                Some(expr) => expr.or(col_filter),
+                None => col_filter,
+            });
+        }
+
+        if let Some(expr) = filter_expr {
+            Ok(df.filter(expr))
+        } else {
+            Ok(df)
+        }
+    }
+
+    /// Apply time filter with lazy evaluation
+    fn apply_time_filter_lazy(&self, df: LazyFrame, filter: &TimeFilter) -> Result<LazyFrame> {
+        match &filter.mode {
+            TimeFilterMode::None => Ok(df),
+            TimeFilterMode::After(ts) => {
+                // Convert seconds to nanoseconds for comparison with Polars datetime
+                let ts_ns = *ts as i64 * 1_000_000_000;
+                Ok(df.filter(col(&filter.column_name).gt(lit(ts_ns))))
+            }
+            TimeFilterMode::Before(ts) => {
+                let ts_ns = *ts as i64 * 1_000_000_000;
+                Ok(df.filter(col(&filter.column_name).lt(lit(ts_ns))))
+            }
+            TimeFilterMode::Range(start, end) => {
+                // Convert seconds to nanoseconds
+                let start_ns = *start as i64 * 1_000_000_000;
+                let end_ns = *end as i64 * 1_000_000_000;
+                // Range: column >= start AND column <= end (inclusive)
+                let start_filter = col(&filter.column_name).gt_eq(lit(start_ns));
+                let end_filter = col(&filter.column_name).lt_eq(lit(end_ns));
+                Ok(df.filter(start_filter.and(end_filter)))
+            }
+            TimeFilterMode::LastN(n, unit) => {
+                let ms_ago = self.calculate_ms_ago(*n, *unit);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                let cutoff_ms = now - ms_ago;
+                // Convert milliseconds to nanoseconds for Polars datetime comparison
+                let cutoff_ns = cutoff_ms * 1_000_000;
+                Ok(df.filter(col(&filter.column_name).gt(lit(cutoff_ns))))
+            }
+        }
+    }
+
     /// Apply search filter to DataFrame
     fn apply_search_filter(&mut self) -> Result<()> {
         let start = Instant::now();
 
-        if self.search_query.is_empty() {
+        if self.search_query.is_empty() && self.time_filters.is_empty() {
             // Reset to original (with sort applied if any)
             self.current_df = Arc::clone(&self.original_df);
         } else {
-            // Build a filter that matches the search query across all string columns.
-            // Arc::clone is cheap - just increments reference count, then we need to clone the DataFrame for lazy.
-            let df = (*self.original_df).clone().lazy();
-
-            // Treat the user input as a full regex. We default to case-insensitive matching by
-            // prefixing (?i) unless the user already provided inline flags at the start.
-            let pattern = if self.search_query.starts_with("(?") {
-                self.search_query.clone()
-            } else {
-                format!("(?i){}", self.search_query)
-            };
-
-            // Validate the regex early to avoid runtime errors in Polars expressions.
-            if let Err(err) = regex::Regex::new(&pattern) {
-                self.status_message = format!("Invalid regex: {}", err);
-                self.search_time_ms = start.elapsed().as_millis() as u64;
-                return Ok(());
-            }
-
-            let visible_cols = self.visible_columns();
-            if visible_cols.is_empty() {
-                self.current_df = Arc::clone(&self.original_df);
-                self.search_time_ms = start.elapsed().as_millis() as u64;
-                return Ok(());
-            }
-
-            // Build filter expression: col1.contains(pattern) OR col2.contains(pattern) OR ...
-            let mut filter_expr: Option<Expr> = None;
-
-            for col_name in &visible_cols {
-                let col_filter = col(*col_name)
-                    .cast(DataType::String)
-                    .str()
-                    .contains(lit(pattern.clone()), false);
-
-                filter_expr = Some(match filter_expr {
-                    Some(expr) => expr.or(col_filter),
-                    None => col_filter,
-                });
-            }
-
-            if let Some(expr) = filter_expr {
-                self.current_df = Arc::new(df.filter(expr).collect()?);
-            }
+            // Use combined filter function
+            return self.apply_all_filters();
         }
 
         // Re-apply sort if active
@@ -574,6 +839,8 @@ impl App {
             AppMode::EditingSearch => self.handle_search_mode(event)?,
             AppMode::ColumnSelection => self.handle_column_selection_mode(event)?,
             AppMode::CellDetail => self.handle_cell_detail_mode(event)?,
+            AppMode::TimeFilterSetup => self.handle_time_filter_setup(event)?,
+            AppMode::TimeFilterConfig => self.handle_time_filter_config(event)?,
         }
         Ok(())
     }
@@ -590,6 +857,16 @@ impl App {
                 // Navigation - Vim style
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1, 0),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1, 0),
+                
+                // Column resize with Alt+Arrow keys (must come before regular arrow keys)
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.resize_selected_column(-2);
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.resize_selected_column(2);
+                }
+                
+                // Regular horizontal navigation
                 KeyCode::Char('l') | KeyCode::Right => self.move_selection(0, 1),
                 KeyCode::Char('h') | KeyCode::Left => self.move_selection(0, -1),
 
@@ -626,11 +903,22 @@ impl App {
                     self.status_message = "Column Selection: Space to toggle, Enter to confirm".to_string();
                 }
 
+                // Time filter
+                KeyCode::Char('t') => {
+                    if !self.datetime_columns.is_empty() {
+                        self.mode = AppMode::TimeFilterSetup;
+                        self.time_filter_list_state.select(Some(0));
+                        self.status_message = "Select datetime column (j/k navigate, Enter confirm, Esc cancel)".to_string();
+                    } else {
+                        self.status_message = "No datetime columns in data".to_string();
+                    }
+                }
+
                 // Clear search
                 KeyCode::Esc => {
                     if !self.search_query.is_empty() {
                         self.search_query.clear();
-                        self.search_input.reset();
+                        self.search_input = Input::default();
                         self.apply_search_filter()?;
                         self.status_message = "Search cleared".to_string();
                     }
@@ -638,7 +926,7 @@ impl App {
 
                 // Help
                 KeyCode::Char('?') => {
-                    self.status_message = "Keys: j/k=↑↓ h/l=←→ /=regex search s=sort c=columns Enter=view cell q=quit".to_string();
+                    self.status_message = "Keys: j/k=↑↓ h/l=←→ /=search s=sort c=columns t=time filter Alt+←/→=resize q=quit".to_string();
                 }
 
                 // View cell detail
@@ -684,7 +972,9 @@ impl App {
         // Get the cell value
         if let Ok(col) = self.current_df.column(col_name.as_str()) {
             if let Ok(val) = col.get(row_idx) {
-                self.cell_detail_content = format!("{}", val);
+                let raw = format!("{}", val);
+                // Sanitize but allow larger display for detail view
+                self.cell_detail_content = sanitize_for_display(&raw, 50000);
             } else {
                 self.cell_detail_content = "<error reading value>".to_string();
             }
@@ -737,6 +1027,211 @@ impl App {
                 _ => {
                     // Forward to input widget
                     self.search_input.handle_event(&event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_time_filter_setup(&mut self, event: Event) -> Result<()> {
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some(selected_idx) = self.time_filter_list_state.selected() {
+                        if selected_idx < self.datetime_columns.len() {
+                            self.selected_time_column = Some(self.datetime_columns[selected_idx].clone());
+                            self.mode = AppMode::TimeFilterConfig;
+                            self.time_filter_mode_choice = None;
+                            self.time_filter_input = Input::default();
+                            self.status_message = "Select filter type: 1=After, 2=Before, 3=Range, 4=Last N, Esc=Cancel".to_string();
+                        }
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let current = self.time_filter_list_state.selected().unwrap_or(0);
+                    let max = self.datetime_columns.len().saturating_sub(1);
+                    if current < max {
+                        self.time_filter_list_state.select(Some(current + 1));
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let current = self.time_filter_list_state.selected().unwrap_or(0);
+                    if current > 0 {
+                        self.time_filter_list_state.select(Some(current - 1));
+                    }
+                }
+                KeyCode::Esc => {
+                    self.mode = AppMode::Normal;
+                    self.status_message = "Time filter cancelled".to_string();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_time_filter_config(&mut self, event: Event) -> Result<()> {
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Char('1') if self.time_filter_mode_choice.is_none() => {
+                    self.time_filter_mode_choice = Some(1);
+                    self.time_filter_input = Input::default();
+                    self.status_message = "After date (format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
+                }
+                KeyCode::Char('2') if self.time_filter_mode_choice.is_none() => {
+                    self.time_filter_mode_choice = Some(2);
+                    self.time_filter_input = Input::default();
+                    self.status_message = "Before date (format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)".to_string();
+                }
+                KeyCode::Char('3') if self.time_filter_mode_choice.is_none() => {
+                    self.time_filter_mode_choice = Some(3);
+                    self.time_filter_input = Input::default();
+                    self.status_message = "Start date (format: YYYY-MM-DD)".to_string();
+                }
+                KeyCode::Char('4') if self.time_filter_mode_choice.is_none() => {
+                    self.time_filter_mode_choice = Some(4);
+                    self.time_filter_input = Input::default();
+                    self.status_message = "Last N units (e.g., '7 days', '24 hours', '30 minutes')".to_string();
+                }
+                KeyCode::Enter if self.time_filter_mode_choice.is_some() => {
+                    let col_name = self.selected_time_column.clone().unwrap_or_default();
+                    let input_str = self.time_filter_input.value().to_string();
+
+                    if input_str.is_empty() {
+                        self.status_message = "Input cannot be empty".to_string();
+                        return Ok(());
+                    }
+
+                    let mode = match self.time_filter_mode_choice {
+                        Some(1) => {
+                            // After
+                            if let Some(ts) = self.parse_datetime(&input_str) {
+                                TimeFilterMode::After(ts)
+                            } else {
+                                self.status_message = "Invalid date format".to_string();
+                                return Ok(());
+                            }
+                        }
+                        Some(2) => {
+                            // Before
+                            if let Some(ts) = self.parse_datetime(&input_str) {
+                                TimeFilterMode::Before(ts)
+                            } else {
+                                self.status_message = "Invalid date format".to_string();
+                                return Ok(());
+                            }
+                        }
+                        Some(3) => {
+                            // Range - two-step process
+                            if self.range_filter_start.is_none() {
+                                // First step: get start date
+                                if let Some(ts) = self.parse_datetime(&input_str) {
+                                    self.range_filter_start = Some(ts);
+                                    self.time_filter_input = Input::default();
+                                    self.status_message = "End date (format: YYYY-MM-DD)".to_string();
+                                    return Ok(()); // Don't apply yet, wait for end date
+                                } else {
+                                    self.status_message = "Invalid date format".to_string();
+                                    return Ok(());
+                                }
+                            } else {
+                                // Second step: get end date
+                                if let Some(end_ts) = self.parse_datetime(&input_str) {
+                                    let start_ts = self.range_filter_start.unwrap();
+                                    if end_ts < start_ts {
+                                        self.status_message = "End date must be after start date".to_string();
+                                        self.range_filter_start = None;
+                                        return Ok(());
+                                    }
+                                    TimeFilterMode::Range(start_ts, end_ts)
+                                } else {
+                                    self.status_message = "Invalid date format".to_string();
+                                    self.range_filter_start = None;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Some(4) => {
+                            // Last N with unit selection: parse "7 days" or "24 hours" etc.
+                            let parts: Vec<&str> = input_str.trim().split_whitespace().collect();
+                            
+                            if parts.is_empty() {
+                                self.status_message = "Format: <number> <unit> (e.g., '7 days', '24 hours')".to_string();
+                                return Ok(());
+                            }
+                            
+                            // Parse number from first part
+                            let n = if let Ok(num) = parts[0].parse::<u32>() {
+                                num
+                            } else {
+                                self.status_message = "Invalid number".to_string();
+                                return Ok(());
+                            };
+                            
+                            // Parse unit from second part, or default to days
+                            let unit = if parts.len() > 1 {
+                                let unit_str = parts[1].to_lowercase();
+                                if unit_str.starts_with("minute") || unit_str == "m" {
+                                    TimeUnit::Minutes
+                                } else if unit_str.starts_with("hour") || unit_str == "h" {
+                                    TimeUnit::Hours
+                                } else if unit_str.starts_with("day") || unit_str == "d" {
+                                    TimeUnit::Days
+                                } else if unit_str.starts_with("week") || unit_str == "w" {
+                                    TimeUnit::Weeks
+                                } else if unit_str.starts_with("month") || unit_str == "mo" {
+                                    TimeUnit::Months
+                                } else {
+                                    self.status_message = "Unknown unit. Use: minutes, hours, days, weeks, months".to_string();
+                                    return Ok(());
+                                }
+                            } else {
+                                TimeUnit::Days // Default to days if no unit specified
+                            };
+                            
+                            TimeFilterMode::LastN(n, unit)
+                        }
+                        _ => TimeFilterMode::None,
+                    };
+
+                    // Add or update the filter
+                    if let Some(col_name_str) = &self.selected_time_column {
+                        // Remove existing filter for this column if any
+                        self.time_filters.retain(|f| f.column_name != *col_name_str);
+                        // Add new filter
+                        self.time_filters.push(TimeFilter {
+                            column_name: col_name_str.clone(),
+                            mode: mode.clone(),
+                        });
+
+                        // Apply filters
+                        self.apply_all_filters()?;
+
+                        self.mode = AppMode::Normal;
+                        self.range_filter_start = None; // Reset range state
+                        self.status_message = format!(
+                            "Time filter applied: {} {}",
+                            col_name,
+                            mode.label()
+                        );
+                    }
+                }
+                KeyCode::Esc => {
+                    if self.time_filter_mode_choice.is_some() {
+                        self.time_filter_mode_choice = None;
+                        self.time_filter_input = Input::default();
+                        self.range_filter_start = None; // Reset range state
+                        self.status_message = "Select filter type: 1=After, 2=Before, 3=Range, 4=Last N, Esc=Cancel".to_string();
+                    } else {
+                        self.mode = AppMode::Normal;
+                        self.range_filter_start = None; // Reset range state
+                        self.status_message = "Time filter cancelled".to_string();
+                    }
+                }
+                _ => {
+                    if self.time_filter_mode_choice.is_some() {
+                        self.time_filter_input.handle_event(&event);
+                    }
                 }
             }
         }
@@ -928,6 +1423,15 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.mode == AppMode::CellDetail {
         render_cell_detail_popup(frame, app);
     }
+
+    // Render time filter popups if active
+    if app.mode == AppMode::TimeFilterSetup {
+        render_time_filter_setup_popup(frame, app);
+    }
+
+    if app.mode == AppMode::TimeFilterConfig {
+        render_time_filter_config_popup(frame, app);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -944,16 +1448,29 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
+    // Build filter info string
+    let filter_info = if app.search_query.is_empty() && app.time_filters.is_empty() {
+        "No filter".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if !app.search_query.is_empty() {
+            parts.push(format!("Search: {}", app.search_query));
+        }
+        if !app.time_filters.is_empty() {
+            for tf in &app.time_filters {
+                parts.push(format!("{}:{}", tf.column_name, tf.mode.label()));
+            }
+        }
+        parts.join(" | ")
+    };
+
     let header_text = format!(
-        " Ninjask │ Rows: {} / {} │ Cols: {} │ {}{}",
+        " 🪲 Ninjask {} │ Rows: {} / {} │ Cols: {} │ {}{}",
+        env!("CARGO_PKG_VERSION"),
         app.filtered_rows,
         app.total_rows,
         app.columns.iter().filter(|c| c.visible).count(),
-        if app.search_query.is_empty() {
-            "No filter"
-        } else {
-            &app.search_query
-        },
+        filter_info,
         timing_info
     );
 
@@ -979,20 +1496,12 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let visible_cols = app.visible_columns();
 
-    if visible_cols.is_empty() || app.current_df.height() == 0 {
-        let empty = Paragraph::new("No data to display")
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(empty, area);
-        return;
-    }
-
-    // Use cached auto-calculated column widths
+    // Use cached auto-calculated column widths (or manual override)
     let widths: Vec<Constraint> = app
         .columns
         .iter()
         .filter(|c| c.visible)
-        .map(|c| Constraint::Length(c.display_width))
+        .map(|c| Constraint::Length(c.manual_width.unwrap_or(c.display_width)))
         .collect();
 
     // Build header row with sort indicators
@@ -1067,24 +1576,34 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|row_idx| {
                 let cells: Vec<Cell> = (0..sliced.width())
                     .map(|col_idx| {
-                        let value = sliced
-                            .get_columns()
-                            .get(col_idx)
-                            .and_then(|s| s.get(row_idx).ok())
-                            .map(|v| format!("{}", v))
-                            .unwrap_or_default();
-
-                        // Get the width for this column
+                        // Get the width for this column (manual or auto)
                         let col_width = app
                             .columns
                             .iter()
                             .filter(|c| c.visible)
                             .nth(col_idx)
-                            .map(|c| c.display_width as usize)
+                            .map(|c| c.manual_width.unwrap_or(c.display_width) as usize)
                             .unwrap_or(10);
 
-                        // Truncate long values for display (Unicode-safe)
-                        let display_value = truncate_string(&value, col_width.saturating_sub(1));
+                        // Safe value extraction with sanitization
+                        let display_value = match sliced
+                            .get_columns()
+                            .get(col_idx)
+                            .and_then(|s| s.get(row_idx).ok())
+                        {
+                            Some(val) => {
+                                let mut raw = format!("{}", val);
+                                
+                                // Strip quotes from string values
+                                if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+                                    raw = raw[1..raw.len()-1].to_string();
+                                }
+                                
+                                // Sanitize and truncate for display
+                                sanitize_for_display(&raw, col_width.saturating_sub(1))
+                            }
+                            None => "<error>".to_string(),
+                        };
 
                         Cell::from(display_value)
                     })
@@ -1149,7 +1668,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 .split(area);
 
             let label = Paragraph::new(" Search: ")
-                .style(Style::default().fg(Color::Yellow).bold());
+                .style(Style::default().fg(Color::Yellow).bold())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                );
             frame.render_widget(label, chunks[0]);
 
             let input = Paragraph::new(app.search_input.value())
@@ -1177,7 +1701,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    "/ search  s sort  c columns  q quit",
+                    "/ search  s sort  c columns  t time-filter  q quit",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]))
@@ -1313,10 +1837,170 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
+    // Create centered popup
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    // Header
+    let header = Paragraph::new(" Select Datetime Column to Filter ")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Cyan).bold())
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan))
+        );
+    frame.render_widget(header, chunks[0]);
+
+    // List of datetime columns
+    let items: Vec<ListItem> = app
+        .datetime_columns
+        .iter()
+        .map(|col| ListItem::new(format!("  {}", col)))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan))
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, chunks[1], &mut app.time_filter_list_state.clone());
+
+    // Footer
+    let footer = Paragraph::new("Enter=confirm, Esc=cancel")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Gray))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan))
+        );
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
+    // Create centered popup
+    let area = centered_rect(70, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    // Header with column name
+    let unknown_col = "Unknown".to_string();
+    let col_name = app.selected_time_column.as_ref().unwrap_or(&unknown_col);
+    let header = Paragraph::new(format!(" Filter: {} ", col_name))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Cyan).bold())
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan))
+        );
+    frame.render_widget(header, chunks[0]);
+
+    // Content area
+    if app.time_filter_mode_choice.is_none() {
+        // Show filter type selection
+        let options = vec![
+            "1: After - Show rows after a specific date",
+            "2: Before - Show rows before a specific date",
+            "3: Range - Show rows between two dates",
+            "4: Last N - Show rows from last N minutes/hours/days/weeks",
+        ];
+        let text = options.join("\n");
+        let content = Paragraph::new(text)
+            .style(Style::default().fg(Color::White))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::Cyan))
+            );
+        frame.render_widget(content, chunks[1]);
+
+        let footer = Paragraph::new("Press 1-4 to select, Esc=cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::Cyan))
+            );
+        frame.render_widget(footer, chunks[2]);
+    } else {
+        // Show input field for the selected filter type
+        let input_label = match app.time_filter_mode_choice {
+            Some(1) => "After date (YYYY-MM-DD):",
+            Some(2) => "Before date (YYYY-MM-DD):",
+            Some(3) => {
+                if app.range_filter_start.is_none() {
+                    "Start date (YYYY-MM-DD):"
+                } else {
+                    "End date (YYYY-MM-DD):"
+                }
+            }
+            Some(4) => "Last N (e.g., '7 days', '24 hours', '30 minutes'):",
+            _ => "Input:",
+        };
+
+        let content = Paragraph::new(format!("{}\n\n{}", input_label, app.time_filter_input.value()))
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::Yellow))
+            );
+        frame.render_widget(content, chunks[1]);
+
+        // Show cursor
+        let input_line = app.time_filter_input.value().len() + 3;
+        frame.set_cursor_position((
+            chunks[1].x + app.time_filter_input.visual_cursor() as u16 + 1,
+            chunks[1].y + input_line as u16,
+        ));
+
+        let footer = Paragraph::new("Enter=apply, Esc=back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::Yellow))
+            );
+        frame.render_widget(footer, chunks[2]);
+    }
+}
+
 // ================= Data Loading =================
 
 /// Load CSV file or generate dummy data if missing
-fn load_data(path: &str) -> Result<(DataFrame, u64)> {
+fn load_data(path: &str) -> Result<(DataFrame, u64, Vec<String>)> {
     let start = Instant::now();
 
     if Path::new(path).exists() {
@@ -1324,9 +2008,10 @@ fn load_data(path: &str) -> Result<(DataFrame, u64)> {
 
         // Load CSV with error handling for malformed lines
         let parse_options = CsvParseOptions::default()
-            .with_truncate_ragged_lines(true); // Handle lines with wrong number of fields
+            .with_truncate_ragged_lines(true) // Handle lines with wrong number of fields
+            .with_encoding(CsvEncoding::LossyUtf8); // Handle invalid UTF-8 gracefully
 
-        let df = CsvReadOptions::default()
+        let mut df = CsvReadOptions::default()
             .with_has_header(true)
             .with_infer_schema_length(Some(1000)) // Infer types from first 1000 rows (Int64, Float64, String, etc.)
             .with_ignore_errors(true) // Skip rows that can't be parsed instead of failing
@@ -1340,6 +2025,12 @@ fn load_data(path: &str) -> Result<(DataFrame, u64)> {
             eprintln!("Warning: CSV file is empty or all rows were skipped due to errors");
         }
 
+        // Parse datetime columns from strings
+        df = parse_datetime_columns(df)?;
+
+        // Detect datetime columns (after parsing)
+        let datetime_columns = detect_datetime_columns(&df);
+
         // Log detected schema
         eprintln!(
             "Loaded {} rows x {} columns",
@@ -1350,13 +2041,100 @@ fn load_data(path: &str) -> Result<(DataFrame, u64)> {
             eprintln!("  - {}: {:?}", col.name(), col.dtype());
         }
 
+        if !datetime_columns.is_empty() {
+            eprintln!("Datetime columns: {}", datetime_columns.join(", "));
+        }
+
         let load_time = start.elapsed().as_millis() as u64;
-        Ok((df, load_time))
+        Ok((df, load_time, datetime_columns))
     } else {
         eprintln!("CSV not found, generating {} dummy rows...", DUMMY_ROWS);
         generate_dummy_csv(path)?;
         load_data(path)
     }
+}
+
+/// Parse string columns that look like datetime into proper Datetime type
+fn parse_datetime_columns(df: DataFrame) -> Result<DataFrame> {
+    // First, scan the dataframe to identify datetime columns
+    let mut datetime_cols = Vec::new();
+    let mut date_cols = Vec::new();
+    
+    for col_name in df.get_column_names() {
+        if let Ok(column) = df.column(col_name) {
+            if matches!(column.dtype(), DataType::String) {
+                // Sample first non-null value to check if it looks like a datetime
+                if let Some(sample) = column.str()
+                    .ok()
+                    .and_then(|s| s.into_iter().find_map(|v| v)) 
+                {
+                    if is_datetime_string(sample) {
+                        datetime_cols.push(col_name.to_string());
+                    } else if is_date_string(sample) {
+                        date_cols.push(col_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Now convert to lazy and apply transformations
+    let mut lazy_df = df.lazy();
+    
+    for col_name in datetime_cols {
+        eprintln!("  Parsing '{}' as datetime column", col_name);
+        lazy_df = lazy_df.with_column(
+            col(&col_name)
+                .str()
+                .to_datetime(
+                    Some(polars::prelude::TimeUnit::Milliseconds),
+                    None,
+                    StrptimeOptions::default(),
+                    lit("raise"),
+                )
+                .cast(DataType::Datetime(polars::prelude::TimeUnit::Nanoseconds, None))
+                .alias(&col_name)
+        );
+    }
+    
+    for col_name in date_cols {
+        eprintln!("  Parsing '{}' as date column", col_name);
+        lazy_df = lazy_df.with_column(
+            col(&col_name)
+                .str()
+                .to_date(StrptimeOptions::default())
+                .alias(&col_name)
+        );
+    }
+    
+    Ok(lazy_df.collect()?)
+}
+
+/// Check if a string looks like a datetime (YYYY-MM-DD with optional time)
+fn is_datetime_string(s: &str) -> bool {
+    // Pattern: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS
+    let has_time_separator = s.contains('T') || (s.contains(' ') && s.contains(':'));
+    let has_date_pattern = s.len() >= 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-');
+    has_date_pattern && has_time_separator
+}
+
+/// Check if a string looks like a date (YYYY-MM-DD only)
+fn is_date_string(s: &str) -> bool {
+    // Pattern: YYYY-MM-DD (exactly 10 chars)
+    s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-')
+}
+
+/// Detect datetime columns in a DataFrame
+fn detect_datetime_columns(df: &DataFrame) -> Vec<String> {
+    df.get_columns()
+        .iter()
+        .filter_map(|col| {
+            match col.dtype() {
+                DataType::Date | DataType::Datetime(_, _) => Some(col.name().to_string()),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Generate dummy CSV file
@@ -1404,7 +2182,7 @@ fn main() -> Result<()> {
     let csv_path = parse_args();
 
     // Load data
-    let (df, load_time_ms) = load_data(&csv_path)?;
+    let (df, load_time_ms, datetime_columns) = load_data(&csv_path)?;
 
     // Setup terminal
     enable_raw_mode()?;
@@ -1416,6 +2194,7 @@ fn main() -> Result<()> {
     // Create app state
     let mut app = App::new(df);
     app.load_time_ms = load_time_ms;
+    app.datetime_columns = datetime_columns;
 
     // Main loop (~60 FPS)
     let result = run_app(&mut terminal, &mut app);

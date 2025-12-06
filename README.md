@@ -14,7 +14,7 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
 1. Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed (nightly not required).
 2. Clone the repository and enter the project directory:
    ```sh
-   git clone <repo-url>
+   git clone git@github.com:waldh4ri/ninjask.git
    cd ninjask
    ```
 3. Build in release mode for best performance:

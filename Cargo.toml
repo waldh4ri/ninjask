@@ -2,7 +2,7 @@
 name = "ninjask"
 version = "0.1.0"
 edition = "2021"
-authors = ["Ninjask Team"]
+authors = ["waldhari"]
 description = "High-performance CSV explorer TUI with virtual scrolling"
 
 [dependencies]
@@ -21,6 +21,9 @@ anyhow = "1.0"
 
 # Regex for search escaping
 regex = "1.12"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 # Temporary directory for tests
