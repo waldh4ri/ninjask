@@ -42,10 +42,11 @@ const DEFAULT_CSV_PATH: &str = "data.csv";
 /// Dummy rows to generate if CSV is missing
 const DUMMY_ROWS: usize = 100_000;
 
-/// Parse command-line arguments and return CSV file path
-fn parse_args() -> String {
+/// Parse command-line arguments and return CSV file path and delimiter
+fn parse_args() -> (String, Option<u8>) {
     let args: Vec<String> = env::args().collect();
     let mut csv_path = DEFAULT_CSV_PATH.to_string();
+    let mut delimiter: Option<u8> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -56,7 +57,29 @@ fn parse_args() -> String {
                     i += 2;
                 } else {
                     eprintln!("Error: -f requires a file path argument");
-                    eprintln!("Usage: ninjask [-f <csv_file>]");
+                    eprintln!("Usage: ninjask [-f <csv_file>] [-d <delimiter>]");
+                    std::process::exit(1);
+                }
+            }
+            "-d" | "--delimiter" => {
+                if i + 1 < args.len() {
+                    let delim_str = &args[i + 1];
+                    delimiter = Some(match delim_str.as_str() {
+                        "tab" | "\\t" | "t" => b'\t',
+                        "comma" | "," => b',',
+                        "semicolon" | ";" => b';',
+                        "pipe" | "|" => b'|',
+                        "space" | " " => b' ',
+                        s if s.len() == 1 => s.as_bytes()[0],
+                        _ => {
+                            eprintln!("Error: Invalid delimiter '{}'. Use a single character or: tab, comma, semicolon, pipe, space", delim_str);
+                            std::process::exit(1);
+                        }
+                    });
+                    i += 2;
+                } else {
+                    eprintln!("Error: -d requires a delimiter argument");
+                    eprintln!("Usage: ninjask [-f <csv_file>] [-d <delimiter>]");
                     std::process::exit(1);
                 }
             }
@@ -66,8 +89,10 @@ fn parse_args() -> String {
                 println!("Usage: ninjask [OPTIONS]");
                 println!();
                 println!("Options:");
-                println!("  -f, --file <PATH>  CSV file to load (default: data.csv)");
-                println!("  -h, --help         Show this help message");
+                println!("  -f, --file <PATH>      CSV file to load (default: data.csv)");
+                println!("  -d, --delimiter <SEP>  Delimiter character (auto-detected if not specified)");
+                println!("                         Examples: ',', ';', 'tab', '|'");
+                println!("  -h, --help             Show this help message");
                 println!();
                 println!("Keybindings:");
                 println!("  j/k or ↑/↓         Navigate rows");
@@ -80,7 +105,7 @@ fn parse_args() -> String {
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
-                eprintln!("Usage: ninjask [-f <csv_file>]");
+                eprintln!("Usage: ninjask [-f <csv_file>] [-d <delimiter>]");
                 std::process::exit(1);
             }
             // Positional argument - treat as file path
@@ -91,7 +116,7 @@ fn parse_args() -> String {
         }
     }
 
-    csv_path
+    (csv_path, delimiter)
 }
 
 /// Input poll timeout (~60 FPS)
@@ -1726,12 +1751,12 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         }
         if !app.time_filters.is_empty() {
             for tf in &app.time_filters {
-                parts.push(format!("{}:{}", tf.column_name, tf.mode.label()));
+                parts.push(format!("{}: {}", tf.column_name, tf.mode.label()));
             }
         }
         if !app.value_filters.is_empty() {
             for vf in &app.value_filters {
-                parts.push(format!("{}:{} vals", vf.column_name, vf.selected_values.len()));
+                parts.push(format!("{}: {} vals", vf.column_name, vf.selected_values.len()));
             }
         }
         parts.join(" | ")
@@ -1884,7 +1909,7 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 let actual_row_idx = viewport_start + row_idx;
                 let style = if Some(actual_row_idx) == app.table_state.selected() {
-                    Style::default().bg(Color::Blue).fg(Color::White)
+                    Style::default().bg(Color::Rgb(0xb9, 0x9c, 0xc8)).fg(Color::Black)
                 } else if actual_row_idx % 2 == 0 {
                     Style::default().bg(Color::Rgb(30, 30, 40))
                 } else {
@@ -2145,7 +2170,8 @@ fn centered_rect_adaptive(percent_x: u16, content_height: u16, max_percent: u16,
 fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
     // Create centered popup with adaptive height
     // Height = header (3) + items + footer (2) = items + 5
-    let content_height = (app.datetime_columns.len() as u16).saturating_add(5);
+    let items_height = app.datetime_columns.len() as u16;
+    let content_height = items_height.saturating_add(5);
     let area = centered_rect_adaptive(60, content_height, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -2153,7 +2179,7 @@ fn render_time_filter_setup_popup(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Length(items_height),
             Constraint::Length(2),
         ])
         .split(area);
@@ -2215,7 +2241,7 @@ fn render_value_filter_popup(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Min(6),
             Constraint::Length(3),
         ])
         .split(area);
@@ -2290,15 +2316,23 @@ fn render_value_filter_popup(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
-    // Create centered popup
-    let area = centered_rect(70, 60, frame.area());
+    // Calculate adaptive height based on content
+    let content_height = if app.time_filter_mode_choice.is_none() {
+        // Selection mode: header (3) + 4 options + 2 padding lines + footer (3) = 12
+        12
+    } else {
+        // Input mode: header (3) + label + input (5 lines total) + footer (3) = 11
+        11
+    };
+    
+    let area = centered_rect_adaptive(70, content_height, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Length(content_height.saturating_sub(6)),
             Constraint::Length(3),
         ])
         .split(area);
@@ -2393,15 +2427,116 @@ fn render_time_filter_config_popup(frame: &mut Frame, app: &mut App) {
 
 // ================= Data Loading =================
 
+/// Detect CSV delimiter by sampling the first few lines
+fn detect_csv_delimiter(path: &str) -> Result<u8> {
+    use std::io::{BufRead, BufReader};
+    
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open file '{}' for delimiter detection", path))?;
+    let reader = BufReader::new(file);
+    
+    // Candidate delimiters to test
+    let candidates = [b',', b';', b'\t', b'|'];
+    
+    // Read first 20 lines (or fewer if file is shorter)
+    let lines: Vec<String> = reader
+        .lines()
+        .take(20)
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    
+    if lines.is_empty() {
+        return Ok(b','); // Default to comma for empty files
+    }
+    
+    // Score each delimiter based on consistency
+    let mut best_delimiter = b',';
+    let mut best_score = 0.0;
+    
+    for &delimiter in &candidates {
+        // Count occurrences per line
+        let counts: Vec<usize> = lines
+            .iter()
+            .map(|line| line.as_bytes().iter().filter(|&&c| c == delimiter).count())
+            .collect();
+        
+        if counts.is_empty() || counts.iter().all(|&c| c == 0) {
+            continue;
+        }
+        
+        // Calculate consistency: how uniform are the counts?
+        let total: usize = counts.iter().sum();
+        let avg = total as f64 / counts.len() as f64;
+        
+        // Skip if average is too low (likely not the delimiter)
+        if avg < 1.0 {
+            continue;
+        }
+        
+        // Calculate variance (lower is better)
+        let variance: f64 = counts
+            .iter()
+            .map(|&c| {
+                let diff = c as f64 - avg;
+                diff * diff
+            })
+            .sum::<f64>() / counts.len() as f64;
+        
+        // Score: prefer high count with low variance
+        // Using inverse of coefficient of variation
+        let std_dev = variance.sqrt();
+        let score = if std_dev < 0.01 {
+            avg * 1000.0 // Perfect consistency
+        } else {
+            avg / (std_dev / avg) // Inverse coefficient of variation
+        };
+        
+        if score > best_score {
+            best_score = score;
+            best_delimiter = delimiter;
+        }
+    }
+    
+    let delimiter_name = match best_delimiter {
+        b',' => "comma (,)",
+        b';' => "semicolon (;)",
+        b'\t' => "tab (\\t)",
+        b'|' => "pipe (|)",
+        _ => "comma (,)",
+    };
+    eprintln!("Auto-detected delimiter: {}", delimiter_name);
+    
+    Ok(best_delimiter)
+}
+
 /// Load CSV file or generate dummy data if missing
-fn load_data(path: &str) -> Result<(DataFrame, u64, Vec<String>)> {
+fn load_data(path: &str, delimiter: Option<u8>) -> Result<(DataFrame, u64, Vec<String>)> {
     let start = Instant::now();
 
     if Path::new(path).exists() {
         eprintln!("Loading CSV: {}", path);
 
+        // Determine delimiter (manual override or auto-detect)
+        let separator = match delimiter {
+            Some(delim) => {
+                let delim_name = match delim {
+                    b',' => "comma (,)",
+                    b';' => "semicolon (;)",
+                    b'\t' => "tab (\\t)",
+                    b'|' => "pipe (|)",
+                    b' ' => "space",
+                    _ => "custom",
+                };
+                eprintln!("Using manual delimiter: {}", delim_name);
+                delim
+            }
+            None => detect_csv_delimiter(path)?,
+        };
+
         // Load CSV with error handling for malformed lines
         let parse_options = CsvParseOptions::default()
+            .with_separator(separator) // Use detected or specified delimiter
             .with_truncate_ragged_lines(true) // Handle lines with wrong number of fields
             .with_encoding(CsvEncoding::LossyUtf8); // Handle invalid UTF-8 gracefully
 
@@ -2444,7 +2579,7 @@ fn load_data(path: &str) -> Result<(DataFrame, u64, Vec<String>)> {
     } else {
         eprintln!("CSV not found, generating {} dummy rows...", DUMMY_ROWS);
         generate_dummy_csv(path)?;
-        load_data(path)
+        load_data(path, delimiter)
     }
 }
 
@@ -2573,10 +2708,10 @@ fn generate_dummy_csv(path: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     // Parse arguments
-    let csv_path = parse_args();
+    let (csv_path, delimiter) = parse_args();
 
     // Load data
-    let (df, load_time_ms, datetime_columns) = load_data(&csv_path)?;
+    let (df, load_time_ms, datetime_columns) = load_data(&csv_path, delimiter)?;
 
     // Setup terminal
     enable_raw_mode()?;
