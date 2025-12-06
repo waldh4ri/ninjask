@@ -42,11 +42,12 @@ const DEFAULT_CSV_PATH: &str = "data.csv";
 /// Dummy rows to generate if CSV is missing
 const DUMMY_ROWS: usize = 100_000;
 
-/// Parse command-line arguments and return CSV file path and delimiter
-fn parse_args() -> (String, Option<u8>) {
+/// Parse command-line arguments and return CSV file path, delimiter, and test mode flag
+fn parse_args() -> (String, Option<u8>, bool) {
     let args: Vec<String> = env::args().collect();
     let mut csv_path = DEFAULT_CSV_PATH.to_string();
     let mut delimiter: Option<u8> = None;
+    let mut test_mode = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -92,16 +93,23 @@ fn parse_args() -> (String, Option<u8>) {
                 println!("  -f, --file <PATH>      CSV file to load (default: data.csv)");
                 println!("  -d, --delimiter <SEP>  Delimiter character (auto-detected if not specified)");
                 println!("                         Examples: ',', ';', 'tab', '|'");
+                println!("  --test                 Generate dummy CSV if file doesn't exist");
                 println!("  -h, --help             Show this help message");
                 println!();
                 println!("Keybindings:");
                 println!("  j/k or ↑/↓         Navigate rows");
                 println!("  h/l or ←/→         Navigate columns");
-                println!("  /                  Search/filter data");
+                println!("  /                  Search data (regex)");
                 println!("  s                  Sort by selected column");
                 println!("  c                  Column visibility picker");
+                println!("  t                  Time filter");
+                println!("  v                  Value filter");
                 println!("  q                  Quit");
                 std::process::exit(0);
+            }
+            "--test" => {
+                test_mode = true;
+                i += 1;
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
@@ -116,7 +124,7 @@ fn parse_args() -> (String, Option<u8>) {
         }
     }
 
-    (csv_path, delimiter)
+    (csv_path, delimiter, test_mode)
 }
 
 /// Input poll timeout (~60 FPS)
@@ -174,6 +182,8 @@ enum AppMode {
     TimeFilterConfig,
     /// Value filter selection - choose values to show
     ValueFilterSetup,
+    /// Help popup is open
+    Help,
 }
 
 /// Sort order for columns
@@ -926,6 +936,7 @@ impl App {
             AppMode::TimeFilterSetup => self.handle_time_filter_setup(event)?,
             AppMode::TimeFilterConfig => self.handle_time_filter_config(event)?,
             AppMode::ValueFilterSetup => self.handle_value_filter_setup(event)?,
+            AppMode::Help => self.handle_help_mode(event)?,
         }
         Ok(())
     }
@@ -939,10 +950,26 @@ impl App {
                     self.should_quit = true
                 }
 
-                // Navigation - Vim style
-                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1, 0),
-                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1, 0),
-                
+                // Jump to first/last row with Ctrl+Up/Ctrl+j or Ctrl+Down/Ctrl+k
+                KeyCode::Up | KeyCode::Char('j')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.jump_to(true);
+                    }
+                KeyCode::Down | KeyCode::Char('k')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.jump_to(false);
+                    }
+
+                // Skip 10 rows up/down with Alt+Up/Alt+j or Alt+Down/Alt+k
+                KeyCode::Up | KeyCode::Char('j')
+                    if key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.move_selection(-10, 0);
+                    }
+                KeyCode::Down | KeyCode::Char('k')
+                    if key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.move_selection(10, 0);
+                    }
+
                 // Column resize with Alt+Arrow keys (must come before regular arrow keys)
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.resize_selected_column(-2);
@@ -950,7 +977,11 @@ impl App {
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.resize_selected_column(2);
                 }
-                
+
+                // Navigation - Vim style
+                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1, 0),
+                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1, 0),
+
                 // Regular horizontal navigation
                 KeyCode::Char('l') | KeyCode::Right => self.move_selection(0, 1),
                 KeyCode::Char('h') | KeyCode::Left => self.move_selection(0, -1),
@@ -1022,7 +1053,7 @@ impl App {
 
                 // Help
                 KeyCode::Char('?') => {
-                    self.status_message = "Keys: j/k=↑↓ h/l=←→ /=search s=sort c=columns t=time v=value filter Alt+←/→=resize q=quit".to_string();
+                    self.mode = AppMode::Help;
                 }
 
                 // View cell detail
@@ -1086,6 +1117,19 @@ impl App {
         if let Event::Key(key) = event {
             match key.code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = AppMode::Normal;
+                    self.status_message = "Ready. Press ? for help.".to_string();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_help_mode(&mut self, event: Event) -> Result<()> {
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
                     self.mode = AppMode::Normal;
                     self.status_message = "Ready. Press ? for help.".to_string();
                 }
@@ -1725,6 +1769,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.mode == AppMode::ValueFilterSetup {
         render_value_filter_popup(frame, app);
     }
+
+    // Render help popup if active
+    if app.mode == AppMode::Help {
+        render_help_popup(frame);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -1763,8 +1812,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let header_text = format!(
-        " 🪲 Ninjask {} │ Rows: {} / {} │ Cols: {} │ {}{}",
-        env!("CARGO_PKG_VERSION"),
+        " Rows: {} / {} │ Cols: {} │ {}{}",
         app.filtered_rows,
         app.total_rows,
         app.columns.iter().filter(|c| c.visible).count(),
@@ -1778,7 +1826,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(" CSV Explorer ")
+                .title(format!(" 🪲 Ninjask {} ", env!("CARGO_PKG_VERSION")))
                 .title_alignment(Alignment::Center),
         );
 
@@ -2115,6 +2163,99 @@ fn render_cell_detail_popup(frame: &mut Frame, app: &App) {
                 .padding(ratatui::widgets::Padding::new(2, 2, 1, 1)),
         );
     frame.render_widget(content, chunks[1]);
+}
+
+/// Render help popup
+fn render_help_popup(frame: &mut Frame) {
+    // Create centered popup (80% width, 70% height)
+    let area = centered_rect(80, 70, frame.area());
+
+    // Clear background
+    frame.render_widget(Clear, area);
+
+    let help_text = vec![
+        ("Navigation", vec![
+            "j/k or ↑↓        Move up/down",
+            "h/l or ←→        Move left/right (columns)",
+            "g or Home        Jump to first row",
+            "G or End         Jump to last row",
+            "Ctrl+↑/j         Jump to first row",
+            "Ctrl+↓/k         Jump to last row",
+            "Alt+↑/j          Skip 10 rows up",
+            "Alt+↓/k          Skip 10 rows down",
+            "PgUp/Ctrl+u      Page up (20 rows)",
+            "PgDn/Ctrl+d      Page down (20 rows)",
+        ]),
+        ("Filtering & Sorting", vec![
+            "/                Start search (regex)",
+            "Esc              Clear all filters",
+            "s                Cycle sort (asc/desc/none)",
+            "t                Set time filter",
+            "v                Set value filter",
+            "c                Column visibility/management",
+        ]),
+        ("Display", vec![
+            "Alt+←/→          Resize selected column",
+            "Enter            View cell details",
+            "?                Show this help",
+            "q or Ctrl+C      Quit",
+        ]),
+    ];
+
+    // Split area into sections
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),      // Title
+            Constraint::Min(10),        // Help content
+            Constraint::Length(2),      // Footer
+        ])
+        .split(area);
+
+    // Title
+    let title = Paragraph::new("Ninjask - CSV Explorer Help")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(title, chunks[0]);
+
+    // Help content
+    let mut help_lines = Vec::new();
+    for (section_title, section_items) in &help_text {
+        help_lines.push(Line::from(Span::styled(
+            format!("  {} ", section_title),
+            Style::default().fg(Color::Yellow).bold(),
+        )));
+        for item in section_items {
+            help_lines.push(Line::from(format!("    {}", item)));
+        }
+        help_lines.push(Line::from(""));
+    }
+
+    let content = Paragraph::new(help_lines)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan))
+                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+        );
+    frame.render_widget(content, chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new("Press ESC, q, or ? to close")
+        .style(Style::default().fg(Color::Gray).italic())
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// Create centered rectangle
@@ -2510,8 +2651,8 @@ fn detect_csv_delimiter(path: &str) -> Result<u8> {
     Ok(best_delimiter)
 }
 
-/// Load CSV file or generate dummy data if missing
-fn load_data(path: &str, delimiter: Option<u8>) -> Result<(DataFrame, u64, Vec<String>)> {
+/// Load CSV file or generate dummy data if missing (only with --test flag)
+fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool) -> Result<(DataFrame, u64, Vec<String>)> {
     let start = Instant::now();
 
     if Path::new(path).exists() {
@@ -2576,10 +2717,15 @@ fn load_data(path: &str, delimiter: Option<u8>) -> Result<(DataFrame, u64, Vec<S
 
         let load_time = start.elapsed().as_millis() as u64;
         Ok((df, load_time, datetime_columns))
-    } else {
+    } else if test_mode {
         eprintln!("CSV not found, generating {} dummy rows...", DUMMY_ROWS);
         generate_dummy_csv(path)?;
-        load_data(path, delimiter)
+        load_data(path, delimiter, test_mode)
+    } else {
+        Err(anyhow::anyhow!(
+            "CSV file '{}' not found. Use --test flag to generate dummy data.",
+            path
+        ))
     }
 }
 
@@ -2708,10 +2854,10 @@ fn generate_dummy_csv(path: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     // Parse arguments
-    let (csv_path, delimiter) = parse_args();
+    let (csv_path, delimiter, test_mode) = parse_args();
 
     // Load data
-    let (df, load_time_ms, datetime_columns) = load_data(&csv_path, delimiter)?;
+    let (df, load_time_ms, datetime_columns) = load_data(&csv_path, delimiter, test_mode)?;
 
     // Setup terminal
     enable_raw_mode()?;
