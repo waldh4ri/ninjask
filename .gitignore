@@ -1,0 +1,40 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Debug and release builds
+debug/
+target/
+**/*.rs.bk
+*.pdb
+
+# Generated test data
+*.csv
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust incremental compilation
+**/*.rmeta
+
+# Backup files
+*.bak
+*.tmp
+
+# OS generated files
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Flamegraph profiling
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Benchmarking results
+criterion/
