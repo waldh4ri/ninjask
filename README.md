@@ -3,12 +3,14 @@
 
 **WIP: Terminal CSV Explorer for Large Files**
 
-Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently exploring large CSV datasets (millions of rows) using SIMD-optimized DataFrame operations (via Polars).
+Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently exploring large CSV datasets (millions of rows) using [Polars](https://pola.rs/) for DataFrame operations. 
 
 - Fast navigation with virtual scrolling (only visible rows rendered)
 - Zero-copy slicing for instant DataFrame operations
 - In-terminal UI (TUI) with column selection, sorting, and regex search
 - Handles malformed CSVs gracefully
+
+Ninjask currently loads the entire DataFrame in memory using Polars' eager API. This can be memory exhausting for very large CSVs (buy more ram lol). Operations like filtering and searching are done through the Lazy API to avoid unnecessary intermediate steps with multiples filters and searches enabled.
 
 ## Compilation Guide
 
@@ -39,6 +41,8 @@ You can generate a dummy 100k lines data.csv like this:
 - `-d, --delimiter <SEP>`: Delimiter character (auto-detected if not specified)
   - Examples: `,`, `;`, `tab`, `|`
 - `--test`: Generate dummy data.csv file if it doesn't exist
+- `--low-memory`: Use low-memory mode for large CSV files (streaming approach)
+- `--no-header`: Treat first row as data (no header row)
 - `-h, --help`: Show this help message
 
 ### Keybindings
@@ -56,8 +60,7 @@ You can generate a dummy 100k lines data.csv like this:
 This tool is experimental and under active development. Performance and features may change.
 
 ## Goals
-- Toy with SIMD-optimized DataFrame for large CSVs
-- Provide a responsive, interactive terminal UI
+- Provide a responsive, interactive terminal UI to quickly get a glance at a CSV
 - Explore Polars and Rust for high-performance data handling
 
 ## License

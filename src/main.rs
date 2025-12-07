@@ -7,8 +7,9 @@
 //! - Virtual viewport: only renders visible rows
 //! - Zero-copy slicing: fast DataFrame operations
 
+use std::borrow::Cow;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -42,12 +43,14 @@ const DEFAULT_CSV_PATH: &str = "data.csv";
 /// Dummy rows to generate if CSV is missing
 const DUMMY_ROWS: usize = 100_000;
 
-/// Parse command-line arguments and return CSV file path, delimiter, and test mode flag
-fn parse_args() -> (String, Option<u8>, bool) {
+/// Parse command-line arguments and return CSV file path, delimiter, test mode flag, low-memory flag, and no-header flag
+fn parse_args() -> (String, Option<u8>, bool, bool, bool) {
     let args: Vec<String> = env::args().collect();
     let mut csv_path = DEFAULT_CSV_PATH.to_string();
     let mut delimiter: Option<u8> = None;
     let mut test_mode = false;
+    let mut low_memory = false;
+    let mut no_header = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -94,6 +97,8 @@ fn parse_args() -> (String, Option<u8>, bool) {
                 println!("  -d, --delimiter <SEP>  Delimiter character (auto-detected if not specified)");
                 println!("                         Examples: ',', ';', 'tab', '|'");
                 println!("  --test                 Generate dummy CSV if file doesn't exist");
+                println!("  --low-memory           Use low-memory mode for large CSV files");
+                println!("  --no-header            Treat first row as data (no header row)");
                 println!("  -h, --help             Show this help message");
                 println!();
                 println!("Keybindings:");
@@ -111,6 +116,14 @@ fn parse_args() -> (String, Option<u8>, bool) {
                 test_mode = true;
                 i += 1;
             }
+            "--low-memory" => {
+                low_memory = true;
+                i += 1;
+            }
+            "--no-header" => {
+                no_header = true;
+                i += 1;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
                 eprintln!("Usage: ninjask [-f <csv_file>] [-d <delimiter>]");
@@ -124,11 +137,13 @@ fn parse_args() -> (String, Option<u8>, bool) {
         }
     }
 
-    (csv_path, delimiter, test_mode)
+    (csv_path, delimiter, test_mode, low_memory, no_header)
 }
 
 /// Input poll timeout (~60 FPS)
 const POLL_TIMEOUT: Duration = Duration::from_millis(16);
+/// Resource sampling cadence (lightweight /proc read)
+const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Truncate string to fit display width (Unicode-safe)
 fn truncate_string(s: &str, max_chars: usize) -> String {
@@ -144,23 +159,28 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
 }
 
 /// Sanitize string for display - handles binary data, control characters, and invalid UTF-8
-fn sanitize_for_display(s: &str, max_chars: usize) -> String {
-    // First pass: clean control characters and normalize whitespace
+fn sanitize_for_display(s: &str, max_chars: usize) -> Cow<'_, str> {
+    // Fast path: if short and clean, return reference (Zero Copy)
+    if s.chars().count() <= max_chars && !s.chars().any(|c| c.is_control() || (c.is_whitespace() && c != ' ' && c != '\n' && c != '\t')) {
+        return Cow::Borrowed(s);
+    }
+
+    // Slow path: single allocation
     let cleaned: String = s
         .chars()
-        .map(|c| {
+        .filter_map(|c| {
             if c.is_control() && c != '\n' && c != '\t' {
-                '�' // Unicode replacement character for control chars
+                Some('\u{FFFD}') // Unicode replacement character for control chars
             } else if c.is_whitespace() && c != ' ' && c != '\n' && c != '\t' {
-                ' ' // Normalize exotic whitespace to regular space
+                Some(' ') // Normalize exotic whitespace to regular space
             } else {
-                c
+                Some(c)
             }
         })
+        .take(max_chars) // Truncate during iteration
         .collect();
-    
-    // Second pass: truncate to max length
-    truncate_string(&cleaned, max_chars)
+
+    Cow::Owned(cleaned)
 }
 
 // ================= Application State Types =================
@@ -394,6 +414,12 @@ struct App {
     value_filter_list_state: ListState,
     /// Column being filtered by value
     value_filter_column: Option<String>,
+    /// Current resident set size in MB (best-effort)
+    memory_usage_mb: u64,
+    /// Peak resident set size observed during session
+    memory_peak_mb: u64,
+    /// Last time we sampled /proc for memory stats
+    last_mem_sample: Instant,
 }
 
 impl App {
@@ -428,7 +454,7 @@ impl App {
 
         let df_arc = Arc::new(df);
 
-        Self {
+        let mut app = Self {
             original_df: Arc::clone(&df_arc),
             current_df: df_arc,
             columns,
@@ -462,6 +488,48 @@ impl App {
             value_filter_selections: Vec::new(),
             value_filter_list_state: ListState::default(),
             value_filter_column: None,
+            memory_usage_mb: 0,
+            memory_peak_mb: 0,
+            last_mem_sample: Instant::now(),
+        };
+
+        // Prime initial memory reading so the header shows data immediately
+        app.refresh_memory_usage();
+
+        app
+    }
+
+    /// Read /proc/self/status to capture resident set size (kB). Linux-only but cheap.
+    fn read_rss_kb() -> Option<u64> {
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        status.lines().find_map(|line| {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    parts[1].parse::<u64>().ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Best-effort memory refresh; throttled by caller
+    fn refresh_memory_usage(&mut self) {
+        if let Some(rss_kb) = Self::read_rss_kb() {
+            let mb = rss_kb / 1024;
+            self.memory_usage_mb = mb;
+            self.memory_peak_mb = self.memory_peak_mb.max(mb);
+        }
+        self.last_mem_sample = Instant::now();
+    }
+
+    /// Sample memory at a low cadence to avoid frame hitching
+    fn maybe_sample_memory(&mut self) {
+        if self.last_mem_sample.elapsed() >= RESOURCE_POLL_INTERVAL {
+            self.refresh_memory_usage();
         }
     }
 
@@ -1101,7 +1169,7 @@ impl App {
             if let Ok(val) = col.get(row_idx) {
                 let raw = format!("{}", val);
                 // Sanitize but allow larger display for detail view
-                self.cell_detail_content = sanitize_for_display(&raw, 50000);
+                self.cell_detail_content = sanitize_for_display(&raw, 50000).into_owned();
             } else {
                 self.cell_detail_content = "<error reading value>".to_string();
             }
@@ -1811,13 +1879,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         parts.join(" | ")
     };
 
+    let memory_info = if app.memory_usage_mb > 0 {
+        format!(" │ Mem: {}MB (peak {}MB)", app.memory_usage_mb, app.memory_peak_mb)
+    } else {
+        String::new()
+    };
+
     let header_text = format!(
-        " Rows: {} / {} │ Cols: {} │ {}{}",
+        " Rows: {} / {} │ Cols: {} │ {}{}{}",
         app.filtered_rows,
         app.total_rows,
         app.columns.iter().filter(|c| c.visible).count(),
         filter_info,
-        timing_info
+        timing_info,
+        memory_info
     );
 
     let header = Paragraph::new(header_text)
@@ -1946,7 +2021,7 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
                                 }
                                 
                                 // Sanitize and truncate for display
-                                sanitize_for_display(&raw, col_width.saturating_sub(1))
+                                sanitize_for_display(&raw, col_width.saturating_sub(1)).into_owned()
                             }
                             None => "<error>".to_string(),
                         };
@@ -2652,7 +2727,7 @@ fn detect_csv_delimiter(path: &str) -> Result<u8> {
 }
 
 /// Load CSV file or generate dummy data if missing (only with --test flag)
-fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool) -> Result<(DataFrame, u64, Vec<String>)> {
+fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool, low_memory: bool, no_header: bool) -> Result<(DataFrame, u64, Vec<String>)> {
     let start = Instant::now();
 
     if Path::new(path).exists() {
@@ -2678,13 +2753,15 @@ fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool) -> Result<(Data
         // Load CSV with error handling for malformed lines
         let parse_options = CsvParseOptions::default()
             .with_separator(separator) // Use detected or specified delimiter
+            .with_try_parse_dates(true)
             .with_truncate_ragged_lines(true) // Handle lines with wrong number of fields
             .with_encoding(CsvEncoding::LossyUtf8); // Handle invalid UTF-8 gracefully
 
-        let mut df = CsvReadOptions::default()
-            .with_has_header(true)
+        let df = CsvReadOptions::default()
+            .with_has_header(!no_header) // Use header unless --no-header flag is set
             .with_infer_schema_length(Some(1000)) // Infer types from first 1000 rows (Int64, Float64, String, etc.)
             .with_ignore_errors(true) // Skip rows that can't be parsed instead of failing
+            .with_low_memory(low_memory) // Use low-memory mode if requested
             .with_parse_options(parse_options)
             .try_into_reader_with_file_path(Some(path.into()))
             .with_context(|| format!("Failed to create CSV reader for '{}'", path))?
@@ -2694,9 +2771,6 @@ fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool) -> Result<(Data
         if df.height() == 0 {
             eprintln!("Warning: CSV file is empty or all rows were skipped due to errors");
         }
-
-        // Parse datetime columns from strings
-        df = parse_datetime_columns(df)?;
 
         // Detect datetime columns (after parsing)
         let datetime_columns = detect_datetime_columns(&df);
@@ -2720,83 +2794,13 @@ fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool) -> Result<(Data
     } else if test_mode {
         eprintln!("CSV not found, generating {} dummy rows...", DUMMY_ROWS);
         generate_dummy_csv(path)?;
-        load_data(path, delimiter, test_mode)
+        load_data(path, delimiter, test_mode, low_memory, no_header)
     } else {
         Err(anyhow::anyhow!(
             "CSV file '{}' not found. Use --test flag to generate dummy data.",
             path
         ))
     }
-}
-
-/// Parse string columns that look like datetime into proper Datetime type
-fn parse_datetime_columns(df: DataFrame) -> Result<DataFrame> {
-    // First, scan the dataframe to identify datetime columns
-    let mut datetime_cols = Vec::new();
-    let mut date_cols = Vec::new();
-    
-    for col_name in df.get_column_names() {
-        if let Ok(column) = df.column(col_name) {
-            if matches!(column.dtype(), DataType::String) {
-                // Sample first non-null value to check if it looks like a datetime
-                if let Some(sample) = column.str()
-                    .ok()
-                    .and_then(|s| s.into_iter().find_map(|v| v)) 
-                {
-                    if is_datetime_string(sample) {
-                        datetime_cols.push(col_name.to_string());
-                    } else if is_date_string(sample) {
-                        date_cols.push(col_name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    
-    // Now convert to lazy and apply transformations
-    let mut lazy_df = df.lazy();
-    
-    for col_name in datetime_cols {
-        eprintln!("  Parsing '{}' as datetime column", col_name);
-        lazy_df = lazy_df.with_column(
-            col(&col_name)
-                .str()
-                .to_datetime(
-                    Some(polars::prelude::TimeUnit::Milliseconds),
-                    None,
-                    StrptimeOptions::default(),
-                    lit("raise"),
-                )
-                .cast(DataType::Datetime(polars::prelude::TimeUnit::Nanoseconds, None))
-                .alias(&col_name)
-        );
-    }
-    
-    for col_name in date_cols {
-        eprintln!("  Parsing '{}' as date column", col_name);
-        lazy_df = lazy_df.with_column(
-            col(&col_name)
-                .str()
-                .to_date(StrptimeOptions::default())
-                .alias(&col_name)
-        );
-    }
-    
-    Ok(lazy_df.collect()?)
-}
-
-/// Check if a string looks like a datetime (YYYY-MM-DD with optional time)
-fn is_datetime_string(s: &str) -> bool {
-    // Pattern: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS
-    let has_time_separator = s.contains('T') || (s.contains(' ') && s.contains(':'));
-    let has_date_pattern = s.len() >= 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-');
-    has_date_pattern && has_time_separator
-}
-
-/// Check if a string looks like a date (YYYY-MM-DD only)
-fn is_date_string(s: &str) -> bool {
-    // Pattern: YYYY-MM-DD (exactly 10 chars)
-    s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-')
 }
 
 /// Detect datetime columns in a DataFrame
@@ -2854,10 +2858,10 @@ fn generate_dummy_csv(path: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     // Parse arguments
-    let (csv_path, delimiter, test_mode) = parse_args();
+    let (csv_path, delimiter, test_mode, low_memory, no_header) = parse_args();
 
     // Load data
-    let (df, load_time_ms, datetime_columns) = load_data(&csv_path, delimiter, test_mode)?;
+    let (df, load_time_ms, datetime_columns) = load_data(&csv_path, delimiter, test_mode, low_memory, no_header)?;
 
     // Setup terminal
     enable_raw_mode()?;
@@ -2893,6 +2897,9 @@ fn main() -> Result<()> {
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
+        // Lightweight resource sampling (throttled) so header stays updated without extra threads
+        app.maybe_sample_memory();
+
         // Render UI
         terminal.draw(|f| ui(f, app))?;
 
