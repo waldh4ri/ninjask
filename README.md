@@ -63,5 +63,9 @@ This tool is experimental and under active development. Performance and features
 - Provide a responsive, interactive terminal UI to quickly get a glance at a CSV
 - Explore Polars and Rust for high-performance data handling
 
+## Credits
+- [Polars](https://pola.rs/) - Lightning-fast DataFrame library for Rust and Python
+- [Ratatui](https://ratatui.rs/) - Rust library for building rich terminal user interfaces
+
 ## License
 MIT
