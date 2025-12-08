@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -637,11 +637,12 @@ impl App {
         None
     }
 
-    /// Apply all filters (search + time filters) to DataFrame
+    /// Apply all filters (search + time filters) and sort to DataFrame
     fn apply_all_filters(&mut self) -> Result<()> {
         let start = Instant::now();
 
-        let mut df = (*self.original_df).clone().lazy();
+        // Convert to lazy WITHOUT dereferencing - use as_ref() to avoid clone
+        let mut df = self.original_df.as_ref().clone().lazy();
 
         // Apply search filter
         if !self.search_query.is_empty() {
@@ -658,12 +659,22 @@ impl App {
             df = self.apply_value_filter_lazy(df, value_filter)?;
         }
 
+        // Apply sort while still lazy (before materialization)
+        if let Some((col_idx, order)) = self.sort_state {
+            if order != SortOrder::None {
+                let col_name = &self.columns[col_idx].name;
+                let descending = order == SortOrder::Descending;
+                df = df.sort(
+                    [col_name],
+                    SortMultipleOptions::new().with_order_descending(descending),
+                );
+            }
+        }
+
+        // Single materialization at the end
         self.current_df = Arc::new(df.collect()?);
         self.filtered_rows = self.current_df.height();
         self.time_filter_ms = start.elapsed().as_millis() as u64;
-
-        // Re-apply sort if active
-        self.apply_current_sort()?;
 
         // Recalculate column widths for filtered data
         self.recalculate_column_widths();
@@ -788,15 +799,27 @@ impl App {
         let start = Instant::now();
 
         if self.search_query.is_empty() && self.time_filters.is_empty() && self.value_filters.is_empty() {
-            // Reset to original (with sort applied if any)
-            self.current_df = Arc::clone(&self.original_df);
+            // Reset to original, but apply sort if needed
+            if let Some((col_idx, order)) = self.sort_state {
+                if order != SortOrder::None {
+                    let col_name = &self.columns[col_idx].name;
+                    let descending = order == SortOrder::Descending;
+                    let mut df = self.original_df.as_ref().clone().lazy();
+                    df = df.sort(
+                        [col_name],
+                        SortMultipleOptions::new().with_order_descending(descending),
+                    );
+                    self.current_df = Arc::new(df.collect()?);
+                } else {
+                    self.current_df = Arc::clone(&self.original_df);
+                }
+            } else {
+                self.current_df = Arc::clone(&self.original_df);
+            }
         } else {
-            // Use combined filter function
+            // Use combined filter function (which now includes sorting)
             return self.apply_all_filters();
         }
-
-        // Re-apply sort if active
-        self.apply_current_sort()?;
 
         self.filtered_rows = self.current_df.height();
 
@@ -815,28 +838,6 @@ impl App {
         // Record search time
         self.search_time_ms = start.elapsed().as_millis() as u64;
 
-        Ok(())
-    }
-
-    /// Apply sort to DataFrame
-    fn apply_current_sort(&mut self) -> Result<()> {
-        if let Some((col_idx, order)) = self.sort_state {
-            if order != SortOrder::None {
-                let col_name = &self.columns[col_idx].name;
-                let descending = order == SortOrder::Descending;
-
-                // Clone the Arc (cheap) and dereference to clone the DataFrame (necessary for lazy)
-                self.current_df = Arc::new(
-                    (*self.current_df).clone()
-                        .lazy()
-                        .sort(
-                            [col_name],
-                            SortMultipleOptions::new().with_order_descending(descending),
-                        )
-                        .collect()?
-                );
-            }
-        }
         Ok(())
     }
 
@@ -864,15 +865,25 @@ impl App {
             Some((original_idx, new_order))
         };
 
-        // Reset to filtered data (or original if no filters)
+        // Rebuild view with new sort order
         if self.search_query.is_empty() && self.time_filters.is_empty() && self.value_filters.is_empty() {
-            self.current_df = Arc::clone(&self.original_df);
+            // No filters - apply sort directly to original
+            if new_order != SortOrder::None {
+                let col_name = &self.columns[original_idx].name;
+                let descending = new_order == SortOrder::Descending;
+                let mut df = self.original_df.as_ref().clone().lazy();
+                df = df.sort(
+                    [col_name],
+                    SortMultipleOptions::new().with_order_descending(descending),
+                );
+                self.current_df = Arc::new(df.collect()?);
+            } else {
+                self.current_df = Arc::clone(&self.original_df);
+            }
         } else {
+            // Has filters - apply_all_filters now handles sorting too
             self.apply_all_filters()?;
-            return Ok(());
         }
-
-        self.apply_current_sort()?;
 
         let col_name = &self.columns[original_idx].name;
         self.status_message = format!(
@@ -1010,10 +1021,18 @@ impl App {
     }
 
     fn handle_normal_mode(&mut self, event: Event) -> Result<()> {
-        if let Event::Key(key) = event {
-            match key.code {
-                // Quit
-                KeyCode::Char('q') => self.should_quit = true,
+        match event {
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.move_selection(-1, 0),
+                    MouseEventKind::ScrollDown => self.move_selection(1, 0),
+                    _ => {}
+                }
+            }
+            Event::Key(key) => {
+                match key.code {
+                    // Quit
+                    KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.should_quit = true
                 }
@@ -1129,8 +1148,10 @@ impl App {
                     self.open_cell_detail();
                 }
 
-                _ => {}
+                    _ => {}
+                }
             }
+            _ => {}
         }
         Ok(())
     }

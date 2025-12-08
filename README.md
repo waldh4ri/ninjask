@@ -41,7 +41,7 @@ You can generate a dummy 100k lines data.csv like this:
 - `-d, --delimiter <SEP>`: Delimiter character (auto-detected if not specified)
   - Examples: `,`, `;`, `tab`, `|`
 - `--test`: Generate dummy data.csv file if it doesn't exist
-- `--low-memory`: Use low-memory mode for large CSV files (streaming approach)
+- `--low-memory`: Use Polars' low-memory mode for large CSV files 
 - `--no-header`: Treat first row as data (no header row)
 - `-h, --help`: Show this help message
 
