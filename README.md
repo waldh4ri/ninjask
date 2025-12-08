@@ -12,6 +12,28 @@ Ninjask is a work-in-progress terminal-based CSV viewer designed for efficiently
 
 Ninjask currently loads the entire DataFrame in memory using Polars' eager API. This can be memory exhausting for very large CSVs (buy more ram lol). Operations like filtering and searching are done through the Lazy API to avoid unnecessary intermediate steps with multiples filters and searches enabled.
 
+## Prerequisites
+
+You'll need a fairly recent Rust installation (1.70.0 or newer recommended).
+
+**Quick install:**
+```sh
+# Install Rust via rustup (official installer)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After installation, restart your terminal or run:
+```sh
+source $HOME/.cargo/env
+```
+
+Verify your installation:
+```sh
+rustc --version
+```
+
+For more details, visit [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install).
+
 ## Compilation Guide
 
 1. Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed (nightly not required).
