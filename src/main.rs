@@ -2,10 +2,6 @@
 //!
 //! Terminal-based CSV viewer for large datasets (millions of rows).
 //! Uses virtual scrolling and zero-copy slicing for efficient navigation.
-//!
-//! # Features
-//! - Virtual viewport: only renders visible rows
-//! - Zero-copy slicing: fast DataFrame operations
 
 use std::borrow::Cow;
 use std::env;
@@ -576,6 +572,84 @@ impl App {
         }
     }
 
+    /// Move the selected column left
+    fn move_column_left(&mut self) {
+        // Get list of visible column indices in the columns vec
+        let visible_indices: Vec<usize> = self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Find position of selected column in visible list
+        if let Some(pos) = visible_indices.iter().position(|&i| {
+            self.visible_column_original_index(self.selected_column) == Some(i)
+        }) {
+            if pos > 0 {
+                // Get the actual indices in the columns vec
+                let current_idx = visible_indices[pos];
+                let left_idx = visible_indices[pos - 1];
+                
+                // Swap the columns
+                self.columns.swap(current_idx, left_idx);
+                
+                // Update sort_state if it references moved columns
+                if let Some((sort_idx, order)) = self.sort_state {
+                    if sort_idx == current_idx {
+                        self.sort_state = Some((left_idx, order));
+                    } else if sort_idx == left_idx {
+                        self.sort_state = Some((current_idx, order));
+                    }
+                }
+                
+                // Move selection to follow the column
+                self.selected_column = pos - 1;
+                
+                self.status_message = format!("Column '{}' moved left", self.columns[left_idx].name);
+            }
+        }
+    }
+
+    /// Move the selected column right
+    fn move_column_right(&mut self) {
+        // Get list of visible column indices in the columns vec
+        let visible_indices: Vec<usize> = self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Find position of selected column in visible list
+        if let Some(pos) = visible_indices.iter().position(|&i| {
+            self.visible_column_original_index(self.selected_column) == Some(i)
+        }) {
+            if pos < visible_indices.len() - 1 {
+                // Get the actual indices in the columns vec
+                let current_idx = visible_indices[pos];
+                let right_idx = visible_indices[pos + 1];
+                
+                // Swap the columns
+                self.columns.swap(current_idx, right_idx);
+                
+                // Update sort_state if it references moved columns
+                if let Some((sort_idx, order)) = self.sort_state {
+                    if sort_idx == current_idx {
+                        self.sort_state = Some((right_idx, order));
+                    } else if sort_idx == right_idx {
+                        self.sort_state = Some((current_idx, order));
+                    }
+                }
+                
+                // Move selection to follow the column
+                self.selected_column = pos + 1;
+                
+                self.status_message = format!("Column '{}' moved right", self.columns[right_idx].name);
+            }
+        }
+    }
+
     /// Get visible column names
     fn visible_columns(&self) -> Vec<&str> {
         self.columns
@@ -763,8 +837,8 @@ impl App {
         match &filter.mode {
             TimeFilterMode::None => Ok(df),
             TimeFilterMode::After(ts) => {
-                // Convert seconds to nanoseconds for comparison with Polars datetime
-                let ts_ns = *ts as i64 * 1_000_000_000;
+                // Convert seconds to microseconds for comparison with Polars datetime
+                let ts_ns = *ts as i64 * 1_000_000;
                 Ok(df.filter(col(&filter.column_name).gt(lit(ts_ns))))
             }
             TimeFilterMode::Before(ts) => {
@@ -772,9 +846,9 @@ impl App {
                 Ok(df.filter(col(&filter.column_name).lt(lit(ts_ns))))
             }
             TimeFilterMode::Range(start, end) => {
-                // Convert seconds to nanoseconds
-                let start_ns = *start as i64 * 1_000_000_000;
-                let end_ns = *end as i64 * 1_000_000_000;
+                // Convert seconds to microseconds
+                let start_ns = *start as i64 * 1_000_000;
+                let end_ns = *end as i64 * 1_000_000;
                 // Range: column >= start AND column <= end (inclusive)
                 let start_filter = col(&filter.column_name).gt_eq(lit(start_ns));
                 let end_filter = col(&filter.column_name).lt_eq(lit(end_ns));
@@ -787,9 +861,7 @@ impl App {
                     .unwrap()
                     .as_millis() as i64;
                 let cutoff_ms = now - ms_ago;
-                // Convert milliseconds to nanoseconds for Polars datetime comparison
-                let cutoff_ns = cutoff_ms * 1_000_000;
-                Ok(df.filter(col(&filter.column_name).gt(lit(cutoff_ns))))
+                Ok(df.filter(col(&filter.column_name).gt(lit(cutoff_ms))))
             }
         }
     }
@@ -1063,6 +1135,14 @@ impl App {
                 }
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.resize_selected_column(2);
+                }
+
+                // Column reordering with Ctrl+Arrow keys
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.move_column_left();
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.move_column_right();
                 }
 
                 // Navigation - Vim style
@@ -2143,7 +2223,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    "/ search  s sort  c columns  t time-filter  v value-filter  q quit",
+                    "/ search  s sort  c columns  t time-filter  v value-filter  Esc reset filters  q quit",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]))
@@ -2292,6 +2372,7 @@ fn render_help_popup(frame: &mut Frame) {
         ]),
         ("Display", vec![
             "Alt+←/→          Resize selected column",
+            "Ctrl+←/→         Move column left/right",
             "Enter            View cell details",
             "?                Show this help",
             "q or Ctrl+C      Quit",

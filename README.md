@@ -14,7 +14,7 @@ Ninjask currently loads the entire DataFrame in memory using Polars' eager API. 
 
 ## Prerequisites
 
-You'll need a fairly recent Rust installation (1.70.0 or newer recommended).
+You'll need a fairly recent Rust installation to build Ninjask (1.70.0 or newer recommended).
 
 **Quick install:**
 ```sh
