@@ -32,19 +32,20 @@ Verify your installation:
 rustc --version
 ```
 
-For more details, visit [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install).
+For more details or Windows installation, visit [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install).
+
+To compile on Windows you'll also need to install [Visual Studio C++ toolkit](https://visualstudio.microsoft.com/fr/vs/features/cplusplus/).
 
 ## Compilation Guide
 
-1. Ensure you have [Rust](https://www.rust-lang.org/tools/install) installed (nightly not required).
-2. Clone the repository and enter the project directory:
+1. Clone the repository and enter the project directory:
    ```sh
-   git clone git@github.com:waldh4ri/ninjask.git
+   git clone https://github.com/waldh4ri/ninjask.git
    ```
    ```sh
    cd ninjask
    ```
-3. Build in release mode for best performance:
+2. Build in release mode for best performance:
    ```sh
    cargo build --release
    ```

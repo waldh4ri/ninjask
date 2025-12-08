@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -669,16 +669,16 @@ impl App {
             .map(|(idx, _)| idx)
     }
 
-    /// Calculate milliseconds ago for relative time filtering
-    fn calculate_ms_ago(&self, n: u32, unit: TimeUnit) -> i64 {
-        let ms = match unit {
-            TimeUnit::Minutes => 60_000,
-            TimeUnit::Hours => 3_600_000,
-            TimeUnit::Days => 86_400_000,
-            TimeUnit::Weeks => 604_800_000,
-            TimeUnit::Months => 2_592_000_000, // 30 days
+    /// Calculate microseconds ago for relative time filtering
+    fn calculate_us_ago(&self, n: u32, unit: TimeUnit) -> i64 {
+        let us = match unit {
+            TimeUnit::Minutes => 60_000_000,
+            TimeUnit::Hours => 3_600_000_000,
+            TimeUnit::Days => 86_400_000_000,
+            TimeUnit::Weeks => 604_800_000_000,
+            TimeUnit::Months => 18_144_000_000_000, // 30 days
         };
-        (n as i64) * ms
+        (n as i64) * us
     }
 
     /// Parse datetime string (supports multiple formats)
@@ -838,30 +838,30 @@ impl App {
             TimeFilterMode::None => Ok(df),
             TimeFilterMode::After(ts) => {
                 // Convert seconds to microseconds for comparison with Polars datetime
-                let ts_ns = *ts as i64 * 1_000_000;
-                Ok(df.filter(col(&filter.column_name).gt(lit(ts_ns))))
+                let ts_us = *ts as i64 * 1_000_000;
+                Ok(df.filter(col(&filter.column_name).gt(lit(ts_us))))
             }
             TimeFilterMode::Before(ts) => {
-                let ts_ns = *ts as i64 * 1_000_000_000;
-                Ok(df.filter(col(&filter.column_name).lt(lit(ts_ns))))
+                let ts_us = *ts as i64 * 1_000_000;
+                Ok(df.filter(col(&filter.column_name).lt(lit(ts_us))))
             }
             TimeFilterMode::Range(start, end) => {
                 // Convert seconds to microseconds
-                let start_ns = *start as i64 * 1_000_000;
-                let end_ns = *end as i64 * 1_000_000;
+                let start_us = *start as i64 * 1_000_000;
+                let end_us = *end as i64 * 1_000_000;
                 // Range: column >= start AND column <= end (inclusive)
-                let start_filter = col(&filter.column_name).gt_eq(lit(start_ns));
-                let end_filter = col(&filter.column_name).lt_eq(lit(end_ns));
+                let start_filter = col(&filter.column_name).gt_eq(lit(start_us));
+                let end_filter = col(&filter.column_name).lt_eq(lit(end_us));
                 Ok(df.filter(start_filter.and(end_filter)))
             }
             TimeFilterMode::LastN(n, unit) => {
-                let ms_ago = self.calculate_ms_ago(*n, *unit);
+                let us_ago = self.calculate_us_ago(*n, *unit);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_millis() as i64;
-                let cutoff_ms = now - ms_ago;
-                Ok(df.filter(col(&filter.column_name).gt(lit(cutoff_ms))))
+                    .as_micros() as i64;
+                let cutoff_us = now - us_ago;
+                Ok(df.filter(col(&filter.column_name).gt(lit(cutoff_us))))
             }
         }
     }
@@ -1079,6 +1079,13 @@ impl App {
 
     /// Handle input events by mode
     fn handle_event(&mut self, event: Event) -> Result<()> {
+        // Filter out key release and repeat events on Windows to prevent doubled input
+        if let Event::Key(key) = &event {
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+        }
+        
         match self.mode {
             AppMode::Normal => self.handle_normal_mode(event)?,
             AppMode::EditingSearch => self.handle_search_mode(event)?,
@@ -2857,7 +2864,8 @@ fn load_data(path: &str, delimiter: Option<u8>, test_mode: bool, low_memory: boo
             .with_separator(separator) // Use detected or specified delimiter
             .with_try_parse_dates(true)
             .with_truncate_ragged_lines(true) // Handle lines with wrong number of fields
-            .with_encoding(CsvEncoding::LossyUtf8); // Handle invalid UTF-8 gracefully
+            .with_encoding(CsvEncoding::LossyUtf8) // Handle invalid UTF-8 gracefully
+            .with_eol_char(b'\n'); // Explicitly handle line endings (works with both \n and \r\n)
 
         let df = CsvReadOptions::default()
             .with_has_header(!no_header) // Use header unless --no-header flag is set
